@@ -7,10 +7,6 @@ permissions:
 concurrency:
   group: build-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
-  # Default is queue: single — one running, one pending. A third dispatch
-  # displaces the pending one, which cancelled a queued build. queue: max
-  # holds up to 100 pending runs and runs them FIFO, so back-to-back
-  # dispatches run in order instead of overwriting each other.
   queue: max
 
 on:
@@ -58,6 +54,13 @@ on:
           - 4k
           - 16k
         default: 4k
+      # ===== 新增：内核名称伪装 =====
+      spoof_uname:
+        description: "伪装内核名称（粘贴原厂 uname -r，留空=不伪装）"
+        required: false
+        type: string
+        default: ""
+      # ===== 新增结束 =====
       brand_name:
         description: "Kernel Branding (empty = stock version string)"
         type: string
@@ -132,7 +135,7 @@ on:
         type: boolean
         default: false
   schedule:
-    - cron: '0 5 * * 1'  # Monday 12am EST (5am UTC)
+    - cron: '0 5 * * 1'
 
 jobs:
   resolve-sources:
@@ -181,8 +184,6 @@ jobs:
           set -euo pipefail
           PAGE_SIZE="${{ inputs.page_size || '4k' }}"
           [ "$PAGE_SIZE" = "16k" ] || exit 0
-          # Only these GKI families use a Kleaf build branch exposing
-          # --page_size (main-kernel-build-2023/2024, main-kernel-2025).
           case "${{ inputs.kernel_build_version }}" in
             6.1.x-android14|6.6.x-android15|6.12.x-android16) ;;
             *)
@@ -199,10 +200,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Commit resolution mode. 'latest' (default) resolves branch tips at
-          # run time via git ls-remote. 'verified' uses the audited pins below for
-          # NoMount, kernelsu/resukisu roots, and SUSFS; KernelSU-Next stays latest.
-          # Scheduled (nightly) runs use latest by default.
           if [ "${{ github.event_name }}" = "schedule" ]; then
             COMMIT_MODE="${{ inputs.commit_mode || 'latest' }}"
           else
@@ -221,11 +218,11 @@ jobs:
             return 1
           }
 
-          resolve_sha() { # repo ref
+          resolve_sha() {
             retry git ls-remote "$1" "$2" | awk '{print $1; exit}'
           }
 
-          emit() { # key value
+          emit() {
             if [ -z "$2" ] || ! [[ "$2" =~ ^[0-9a-f]{40}$ ]]; then
               echo "Failed to resolve $1 (got: ${2:-empty})" >&2
               exit 1
@@ -233,7 +230,6 @@ jobs:
             echo "$1=$2" >> "$GITHUB_OUTPUT"
           }
 
-          # Audited pins (from root-variants.yml). Used only when commit_mode=verified.
           PIN_NOMOUNT="5a610db7649a59eb3e3d710653618d594941f8da"
           PIN_KERNELSU="08a3b087e49227c8a6731c5f1114998b5e25255b"
           PIN_RESUKISU="94dd3c93c2053a84fd752df6eb85db99b7d70ab8"
@@ -247,8 +243,6 @@ jobs:
             [susfs_commit_android15_6_6]="a0f9c59e2243f8a5db955f4ad1686d5e0ad26e1a"
             [susfs_commit_android16_6_12]="b213c54126fb243595ce7876e91d84d6e0861fec"
           )
-          # ReSukiSU keeps its own SUSFS pin set (currently the shared values,
-          # including 6.1 = 0ff93279). KernelSU's set above already diverges on 6.1.
           declare -A PIN_SUSFS_RESUKISU=(
             [susfs_commit_android12_5_10]="9892175b4acec7ee844e113b8d02c0f4d12cdfac"
             [susfs_commit_android13_5_10]="5326e21a7eb232f9e21debdd5164e99bee3d1e2f"
@@ -258,7 +252,6 @@ jobs:
             [susfs_commit_android15_6_6]="a0f9c59e2243f8a5db955f4ad1686d5e0ad26e1a"
             [susfs_commit_android16_6_12]="b213c54126fb243595ce7876e91d84d6e0861fec"
           )
-          # SukiSU-Ultra keeps its own SUSFS pin set too (same starting values).
           declare -A PIN_SUSFS_SUKISU_ULTRA=(
             [susfs_commit_android12_5_10]="9892175b4acec7ee844e113b8d02c0f4d12cdfac"
             [susfs_commit_android13_5_10]="5326e21a7eb232f9e21debdd5164e99bee3d1e2f"
@@ -269,7 +262,7 @@ jobs:
             [susfs_commit_android16_6_12]="b213c54126fb243595ce7876e91d84d6e0861fec"
           )
 
-          pick() { # pinned repo ref  -> pinned when verified, else latest
+          pick() {
             local pinned="$1" repo="$2" ref="$3"
             if [ "$COMMIT_MODE" = "verified" ] && [ -n "$pinned" ]; then
               echo "$pinned"
@@ -278,26 +271,10 @@ jobs:
             fi
           }
 
-          # NoMount (pinned in verified mode, else dev tip)
           emit nomount_commit "$(pick "$PIN_NOMOUNT" https://github.com/maxsteeel/nomount.git refs/heads/dev)"
-
-          # KernelSU-Next manager - always built from the official repo's dev branch.
-          # pershoot's fork is used only for the kernel SUSFS integration (root_commit below),
-          # never for the manager. Manager always builds at latest.
           emit kernelsu_commit "$(resolve_sha https://github.com/KernelSU-Next/KernelSU-Next.git refs/heads/dev)"
           echo "kernelsu_branch=dev" >> "$GITHUB_OUTPUT"
 
-          # Selected root implementation(s). Maps the human-facing choice
-          # (KernelSU-Next / KernelSU / ReSukiSU / SukiSU-Ultra / KowSU /
-          # No Root / All) to internal root-setup flavors (next / kernelsu /
-          # resukisu / sukisu-ultra / kowsu / none). 'All' emits a matrix of
-          # the three core root flavors plus each pinned commit; SukiSU-Ultra,
-          # KowSU, and No Root are opt-in only and never part of 'All'.
-          #
-          # kernelsu, resukisu, and sukisu-ultra pin in verified mode;
-          # KernelSU-Next (next) always builds at latest.
-          # With SUSFS off, every root tracks latest instead of pins:
-          # SukiSU-Ultra follows main (builtin only matters for SUSFS builds).
           if [ "${{ inputs.use_susfs }}" = "true" ]; then
             KERNELSU_COMMIT="$(pick "$PIN_KERNELSU" https://github.com/tiann/KernelSU.git refs/heads/main)"
             RESUKISU_COMMIT="$(pick "$PIN_RESUKISU" https://github.com/ReSukiSU/ReSukiSU.git refs/heads/main)"
@@ -310,8 +287,6 @@ jobs:
           emit ksu_commit "$KERNELSU_COMMIT"
           emit resukisu_commit "$RESUKISU_COMMIT"
           emit sukisu_ultra_commit "$SUKISU_ULTRA_COMMIT"
-          # KowSU has no SUSFS support, so it always tracks latest on master
-          # (it can only ever run with SUSFS off — enforced below).
           KOWSU_COMMIT="$(resolve_sha https://github.com/KOWX712/KernelSU.git refs/heads/master)"
           emit kowsu_commit "$KOWSU_COMMIT"
           if [ "${{ inputs.use_susfs }}" = "true" ]; then
@@ -320,14 +295,10 @@ jobs:
             NEXT_COMMIT="$(resolve_sha https://github.com/KernelSU-Next/KernelSU-Next.git refs/heads/dev)"
           fi
 
-          mk_entry() { # flavor variant commit
+          mk_entry() {
             printf '{"root_flavor":"%s","variant":"%s","root_commit":"%s"}' "$1" "$2" "$3"
           }
 
-          # On 'schedule' there are no inputs, so the default must be the exact
-          # label the "All" arm matches below — a bare 'All' fell through to *)
-          # and failed the whole job, yet the manager step's All* glob still
-          # matched, so the two steps disagreed. Keep these in sync.
           case "${{ inputs.root_flavor || 'All (KernelSU-Next + KernelSU + ReSukiSU)' }}" in
             KernelSU)
               echo "root_flavor=kernelsu" >> "$GITHUB_OUTPUT"
@@ -364,7 +335,6 @@ jobs:
               ROOT_MATRIX='[{"root_flavor":"none","variant":"NoRoot","root_commit":""}]'
               ;;
             "All (KernelSU-Next + KernelSU + ReSukiSU)")
-              # Fan out to all three root variants, each with its pinned commit.
               ROOT_MATRIX="[$(mk_entry next KernelSU-Next "$NEXT_COMMIT"),$(mk_entry kernelsu KernelSU "$KERNELSU_COMMIT"),$(mk_entry resukisu ReSukiSU "$RESUKISU_COMMIT")]"
               echo "root_flavor=" >> "$GITHUB_OUTPUT"
               echo "root_commit=" >> "$GITHUB_OUTPUT"
@@ -376,9 +346,6 @@ jobs:
           esac
           echo "root_matrix=$ROOT_MATRIX" >> "$GITHUB_OUTPUT"
 
-          # SUSFS per supported Android/kernel branch (gitlab simonpunk/susfs4ksu).
-          # Always emit the verified pinned SHA here; build.yml overrides to the
-          # latest branch tip per-variant when the root flavor is KernelSU-Next.
           declare -A SUSFS_BRANCHES=(
             [susfs_commit_android12_5_10]="gki-android12-5.10"
             [susfs_commit_android13_5_10]="gki-android13-5.10"
@@ -390,13 +357,10 @@ jobs:
           )
           for key in "${!SUSFS_BRANCHES[@]}"; do
             emit "$key" "$(pick "${PIN_SUSFS[$key]}" https://gitlab.com/simonpunk/susfs4ksu.git refs/heads/${SUSFS_BRANCHES[$key]})"
-            # Per-flavor ReSukiSU SUSFS pin (same branch, own pin set).
             emit "${key}_resukisu" "$(pick "${PIN_SUSFS_RESUKISU[$key]}" https://gitlab.com/simonpunk/susfs4ksu.git refs/heads/${SUSFS_BRANCHES[$key]})"
-            # Per-flavor SukiSU-Ultra SUSFS pin (same branch, own pin set).
             emit "${key}_sukisu_ultra" "$(pick "${PIN_SUSFS_SUKISU_ULTRA[$key]}" https://gitlab.com/simonpunk/susfs4ksu.git refs/heads/${SUSFS_BRANCHES[$key]})"
           done
 
-          # Tracked build helpers (resolved automatically, before the run)
           emit kernel_patches_commit "$(resolve_sha https://github.com/WildKernels/kernel_patches.git refs/heads/main)"
           emit anykernel3_commit   "$(resolve_sha https://github.com/WildKernels/AnyKernel3.git refs/heads/gki-2.0)"
           emit droidspaces_commit  "$(resolve_sha https://github.com/ravindu644/Droidspaces-OSS.git refs/heads/main)"
@@ -412,25 +376,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Credit: authenticated gh-API manager lookup adapted from EmberHeart-Kernels
-          # commit ae9a341 (nullptr-t-oss/composite_actions fetch_ksu_manager).
-          # Each selected root must ship ALL manager APK builds. KernelSU-Next publishes
-          # its manager APKs (manager + manager-spoofed) from the official dev-tip
-          # build-manager-ci run; kernelsu (KernelSU), ReSukiSU, SukiSU-Ultra,
-          # and KowSU expose theirs as CI-run artifacts. All are pinned to an exact commit.
-          # No Root ships no manager.
-          resolve_one() { # flavor
+          resolve_one() {
             local flavor="$1"
             local owner repo wf stock
             case "$flavor" in
               next)
                 owner="KernelSU-Next"; repo="KernelSU-Next"; wf="build-manager-ci.yml"
-                # Manager is built from the official dev-tip commit (grabbed at run start).
                 stock="${{ steps.resolve.outputs.kernelsu_commit }}"
                 run_id=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?head_sha=${stock}" \
                   --jq '.workflow_runs[0].id // empty')
                 if [[ -z "${run_id}" ]]; then
-                  echo "No manager build for dev tip ${stock}, falling back to latest successful run" >&2
                   fb=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?branch=dev&status=success&per_page=1")
                   run_id=$(echo "$fb" | jq -r '.workflow_runs[0].id // empty')
                   stock=$(echo "$fb" | jq -r '.workflow_runs[0].head_sha // empty')
@@ -443,14 +398,12 @@ jobs:
                 printf '{"flavor":"%s","owner":"%s","repo":"%s","source":"run","run_id":%s,"stock":"%s","want":"manager,manager-spoofed"}' \
                   "$flavor" "$owner" "$repo" "$run_id" "$stock"
                 ;;
-
               kernelsu)
                 owner="tiann"; repo="KernelSU"; wf="build-manager.yml"
                 stock=$(git ls-remote https://github.com/tiann/KernelSU.git refs/heads/main | awk '{print $1; exit}')
                 run_id=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?head_sha=${stock}" \
                   --jq '.workflow_runs[0].id // empty')
                 if [[ -z "${run_id}" ]]; then
-                  echo "No manager build for stock ${stock}, falling back to latest successful run" >&2
                   fb=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?branch=main&status=success&per_page=1")
                   run_id=$(echo "$fb" | jq -r '.workflow_runs[0].id // empty')
                   stock=$(echo "$fb" | jq -r '.workflow_runs[0].head_sha // empty')
@@ -469,7 +422,6 @@ jobs:
                 run_id=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?head_sha=${stock}" \
                   --jq '.workflow_runs[0].id // empty')
                 if [[ -z "${run_id}" ]]; then
-                  echo "No manager build for stock ${stock}, falling back to latest successful run" >&2
                   fb=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?branch=main&status=success&per_page=1")
                   run_id=$(echo "$fb" | jq -r '.workflow_runs[0].id // empty')
                   stock=$(echo "$fb" | jq -r '.workflow_runs[0].head_sha // empty')
@@ -488,7 +440,6 @@ jobs:
                 run_id=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?head_sha=${stock}" \
                   --jq '.workflow_runs[0].id // empty')
                 if [[ -z "${run_id}" ]]; then
-                  echo "No manager build for stock ${stock}, falling back to latest successful run" >&2
                   fb=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?branch=main&status=success&per_page=1")
                   run_id=$(echo "$fb" | jq -r '.workflow_runs[0].id // empty')
                   stock=$(echo "$fb" | jq -r '.workflow_runs[0].head_sha // empty')
@@ -507,7 +458,6 @@ jobs:
                 run_id=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?head_sha=${stock}" \
                   --jq '.workflow_runs[0].id // empty')
                 if [[ -z "${run_id}" ]]; then
-                  echo "No manager build for stock ${stock}, falling back to latest successful run" >&2
                   fb=$(gh api "repos/${owner}/${repo}/actions/workflows/${wf}/runs?branch=master&status=success&per_page=1")
                   run_id=$(echo "$fb" | jq -r '.workflow_runs[0].id // empty')
                   stock=$(echo "$fb" | jq -r '.workflow_runs[0].head_sha // empty')
@@ -551,16 +501,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          # Root is optional now ('No Root' builds ship no root implementation),
-          # so SUSFS on a No Root build applies kernel-side only.
-
-          # A Release/Pre-Release ships whichever manger build(s) were resolved
-          # in the manager step above (exact match per root flavor). No root
-          # restriction applies here anymore -- KernelSU-Next, KernelSU, ReSukiSU,
-          # SukiSU-Ultra, KowSU, or 'All' are all valid release targets ('No Root'
-          # ships no manager).
-
           FEATURES=""
           [ "${{ inputs.use_susfs }}" = "true" ] && FEATURES="${FEATURES}SUSFS+"
           [ "${{ inputs.use_nomount }}" = "true" ] && FEATURES="${FEATURES}NoMount+"
@@ -580,8 +520,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p sources
-
-          # NoMount kernel sources at the resolved commit (pinned or dev tip)
           git clone --no-checkout https://github.com/maxsteeel/nomount.git sources/nomount
           git -C sources/nomount fetch --depth=1 origin "${{ steps.resolve.outputs.nomount_commit }}"
           git -C sources/nomount checkout --detach "${{ steps.resolve.outputs.nomount_commit }}"
@@ -667,7 +605,6 @@ jobs:
               fi
             )
           done
-          # Filter ReSukiSU to only release universal and universal spoofed (drop debug/non-universal)
           if grep -q "ReSukiSU|ReSukiSU|" "$MANIFEST" 2>/dev/null; then
             tmp_manifest="${MANIFEST}.filtered"
             : > "$tmp_manifest"
@@ -675,16 +612,13 @@ jobs:
               [ -n "$n" ] || continue
               if [ "$o" = "ReSukiSU" ] && [ "$r" = "ReSukiSU" ]; then
                 ln=$(echo "$n" | tr '[:upper:]' '[:lower:]')
-                # keep only universal apks, drop debug
                 if [[ "$ln" != *universal* ]]; then echo "Dropping ReSukiSU non-universal $n" >&2; rm -f "$OUT_APKS/$n"; continue; fi
                 if [[ "$ln" == *debug* ]]; then echo "Dropping ReSukiSU debug $n" >&2; rm -f "$OUT_APKS/$n"; continue; fi
-                # now only universal release and universal spoofed remain
               fi
               echo "$o|$r|$n" >> "$tmp_manifest"
             done < "$MANIFEST"
             mv "$tmp_manifest" "$MANIFEST"
           fi
-          # Build the flat apk list from the manifest (single source of truth)
           APK_JSON="[]"
           while IFS='|' read -r o r n; do
             [ -n "$n" ] || continue
@@ -789,6 +723,9 @@ jobs:
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
       keep_kmi: ${{ inputs.keep_kmi }}
+      # ===== 新增：透传 spoof_uname =====
+      spoof_uname: ${{ inputs.spoof_uname }}
+      # ===== 新增结束 =====
       os_patch_level: ${{ inputs.os_patch_level }}
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
@@ -819,6 +756,9 @@ jobs:
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
       keep_kmi: ${{ inputs.keep_kmi }}
+      # ===== 新增：透传 spoof_uname =====
+      spoof_uname: ${{ inputs.spoof_uname }}
+      # ===== 新增结束 =====
       os_patch_level: ${{ inputs.os_patch_level }}
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
@@ -849,6 +789,9 @@ jobs:
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
       keep_kmi: ${{ inputs.keep_kmi }}
+      # ===== 新增：透传 spoof_uname =====
+      spoof_uname: ${{ inputs.spoof_uname }}
+      # ===== 新增结束 =====
       os_patch_level: ${{ inputs.os_patch_level }}
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
@@ -879,6 +822,9 @@ jobs:
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
       keep_kmi: ${{ inputs.keep_kmi }}
+      # ===== 新增：透传 spoof_uname =====
+      spoof_uname: ${{ inputs.spoof_uname }}
+      # ===== 新增结束 =====
       os_patch_level: ${{ inputs.os_patch_level }}
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
@@ -909,6 +855,9 @@ jobs:
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
       keep_kmi: ${{ inputs.keep_kmi }}
+      # ===== 新增：透传 spoof_uname =====
+      spoof_uname: ${{ inputs.spoof_uname }}
+      # ===== 新增结束 =====
       os_patch_level: ${{ inputs.os_patch_level }}
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
@@ -939,6 +888,9 @@ jobs:
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
       keep_kmi: ${{ inputs.keep_kmi }}
+      # ===== 新增：透传 spoof_uname =====
+      spoof_uname: ${{ inputs.spoof_uname }}
+      # ===== 新增结束 =====
       os_patch_level: ${{ inputs.os_patch_level }}
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
@@ -969,6 +921,9 @@ jobs:
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
       keep_kmi: ${{ inputs.keep_kmi }}
+      # ===== 新增：透传 spoof_uname =====
+      spoof_uname: ${{ inputs.spoof_uname }}
+      # ===== 新增结束 =====
       os_patch_level: ${{ inputs.os_patch_level }}
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
@@ -1032,6 +987,7 @@ jobs:
         fi
         git commit -m "chore(pins): promote verified commits to latest built (${STAMP})"
         git push
+
   rej:
     if: "github.event_name == 'workflow_dispatch' && !inputs.test_release_notes && always()"
     runs-on: ubuntu-latest
@@ -1046,7 +1002,6 @@ jobs:
     - build-android14-6-1
     - build-android15-6-6
     - build-android16-6-12
-
     steps:
     - name: Download Misc Artifacts
       uses: actions/download-artifact@v7
@@ -1058,19 +1013,14 @@ jobs:
     - name: Process Reject Artifacts
       run: |
         mkdir -p aio-rejects
-
-        # Iterate over Rejects artifacts in downloaded-artifacts
         for dir in ./downloaded-artifacts/*-Rejects; do
             [ -d "$dir" ] || continue
-
             dirname=$(basename "$dir")
             original_name=${dirname%-Rejects}
             source_dir="$dir"
-
             if [ -d "$dir/patch-rejects" ]; then
               source_dir="$dir/patch-rejects"
             fi
-
             mapfile -t rej_files < <(find "$source_dir" -type f -name '*.rej' | sort)
             filtered_rej_files=()
             for rej_file in "${rej_files[@]}"; do
@@ -1082,23 +1032,18 @@ jobs:
               fi
               filtered_rej_files+=("$rej_file")
             done
-
             if [ "${#filtered_rej_files[@]}" -eq 0 ]; then
               echo "Skipping $dirname because it only contains ignored reject files"
               continue
             fi
-
             mkdir -p "aio-rejects/$original_name"
-
             if [ -d "$dir/patch-rejects" ]; then
               cp -r "$dir/patch-rejects/." "aio-rejects/$original_name/"
             else
               cp -r "$dir/." "aio-rejects/$original_name/"
             fi
-
             find "aio-rejects/$original_name" -type f -name 'i2c-nomadik.c.rej' -delete
         done
-
         if [ "$(ls -A aio-rejects)" ]; then
             cd aio-rejects
             zip -r -q -9 ../AIO-REJ.zip .
@@ -1120,12 +1065,6 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    # always() so a skipped sibling doesn't cascade: on a single-family
-    # dispatch the other six build jobs skip, and a skipped need skips
-    # this job too, making Pre-Release/Release unreachable outside a
-    # full 7-family run. The contains() checks keep a genuinely failed
-    # or cancelled build from publishing. needs.* rather than a per-job
-    # list so a new family doesn't need editing here.
     if: >-
       always() && !cancelled() &&
       github.event_name == 'workflow_dispatch' &&
@@ -1147,7 +1086,6 @@ jobs:
     - build-nomount-module
     - publish-manager-artifacts
     - notes-preview
-
     env:
       GH_TOKEN: ${{ github.token }}
     outputs:
@@ -1156,15 +1094,12 @@ jobs:
     - name: Validate Selected Builds
       run: |
         set -euo pipefail
-
         failed=0
         current_type="${{ inputs.kernel_build_version }}"
-
         check_selected() {
           local target="$1"
           local job_name="$2"
           local result="$3"
-          
           if [[ "$current_type" == "all" || "$current_type" == "$target" ]]; then
             if [[ "$result" != "success" ]]; then
               echo "Required job $job_name did not succeed (result: $result)"
@@ -1172,7 +1107,6 @@ jobs:
             fi
           fi
         }
-
         check_selected "5.10.x-android12" "build-android12-5-10" "${{ needs.build-android12-5-10.result }}"
         check_selected "5.10.x-android13" "build-android13-5-10" "${{ needs.build-android13-5-10.result }}"
         check_selected "5.15.x-android13" "build-android13-5-15" "${{ needs.build-android13-5-15.result }}"
@@ -1180,14 +1114,13 @@ jobs:
         check_selected "6.1.x-android14" "build-android14-6-1" "${{ needs.build-android14-6-1.result }}"
         check_selected "6.6.x-android15" "build-android15-6-6" "${{ needs.build-android15-6-6.result }}"
         check_selected "6.12.x-android16" "build-android16-6-12" "${{ needs.build-android16-6-12.result }}"
-
         if [[ "$failed" -ne 0 ]]; then
           exit 1
         fi
 
     - name: Free Disk Space
       if: true
-      uses: endersonmenezes/free-disk-space@v3  # Use @main for latest, @v3 for stable
+      uses: endersonmenezes/free-disk-space@v3
       with:
         remove_android: true
         remove_dotnet: true
@@ -1197,8 +1130,8 @@ jobs:
         remove_packages: "azure-cli google-cloud-cli microsoft-edge-stable google-chrome-stable firefox postgresql* temurin-* *llvm* mysql* dotnet-sdk-*"
         remove_packages_one_command: true
         remove_folders: "/usr/share/swift /usr/share/miniconda /usr/share/az* /usr/local/lib/node_modules /usr/local/share/chromium /usr/local/share/powershell /usr/local/julia /usr/local/aws-cli /usr/local/aws-sam-cli /usr/share/gradle"
-        rm_cmd: "rmz"  # Use 'rmz' for faster deletion (default: 'rm')
-        rmz_version: "3.1.1"  # Required when rm_cmd is 'rmz'
+        rm_cmd: "rmz"
+        rmz_version: "3.1.1"
         testing: false
 
     - name: Checkout code
@@ -1209,7 +1142,6 @@ jobs:
       if: inputs.release_type != 'CI'
       run: |
         mapfile -t RELEASE_TAGS < <(gh api --paginate "repos/${{ github.repository }}/tags?per_page=100" --jq '.[].name' 2>/dev/null | grep -E '^r[0-9]+$' || true)
-
         LATEST_REV=0
         for TAG in "${RELEASE_TAGS[@]}"; do
           REV="${TAG#r}"
@@ -1217,13 +1149,11 @@ jobs:
             LATEST_REV="$REV"
           fi
         done
-
         if [[ "$LATEST_REV" -gt 0 ]]; then
           NEW_TAG="r$((LATEST_REV + 1))"
         else
           NEW_TAG="r1"
         fi
-
         if [[ ${#RELEASE_TAGS[@]} -gt 0 ]]; then
           echo "Latest r-tag: r${LATEST_REV}"
         else
@@ -1237,15 +1167,12 @@ jobs:
       id: release_meta
       run: |
         set -euo pipefail
-
-        # Format release title: convert rN -> Release N
         if [[ "${NEW_TAG}" =~ ^r([0-9]+)$ ]]; then
           REV_NUM="${BASH_REMATCH[1]}"
           release_title="Release ${REV_NUM}"
         else
           release_title="Release ${NEW_TAG}"
         fi
-
         echo "release_title=$release_title" >> "$GITHUB_OUTPUT"
 
     - name: Extract KernelSU Version Info
@@ -1254,11 +1181,8 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
-
         KSU_REPO="https://github.com/pershoot/KernelSU-Next.git"
         KSU_INPUT="dev-susfs"
-
-        # Try as branch first, fall back to commit
         if git ls-remote --heads "$KSU_REPO" "$KSU_INPUT" | grep -q .; then
           echo "Cloning KernelSU-Next from branch: $KSU_INPUT"
           git clone --branch "$KSU_INPUT" "$KSU_REPO" /tmp/kernelsu-next
@@ -1272,12 +1196,6 @@ jobs:
           git checkout "$KSU_INPUT"
           KSUN_COMMIT="$KSU_INPUT"
         fi
-
-        # The manager is built on the OFFICIAL KernelSU-Next repo
-        # (pershoot's workflows are all disabled). Find the official dev
-        # commit this fork's branch is synced with (merge-base of our
-        # branch vs official dev), then link the manager build run for
-        # that commit. pershoot's own dev branch is intentionally ignored.
         retry() {
           local n=0
           until [ "$n" -ge 5 ]; do
@@ -1288,43 +1206,26 @@ jobs:
           done
           return 1
         }
-
         OFFICIAL_KSU_REPO="https://github.com/KernelSU-Next/KernelSU-Next.git"
         retry git fetch "$OFFICIAL_KSU_REPO" dev
         STOCK_COMMIT=$(git merge-base HEAD FETCH_HEAD)
         echo "KSU Stock Commit (official sync point): $STOCK_COMMIT"
-
-        # Extract version info - anchored to the official sync point
-        # (STOCK_COMMIT), i.e. the commit the linked manager is built from.
-        # Mirrors pershoot c0a2c5fd: count the merge-base with origin, not
-        # the fork's extra commits, so the version shown in the release
-        # notes matches what the kernel reports and the manager displays.
         COMMITS_COUNT=$(git rev-list --count "$STOCK_COMMIT")
         BASE_VERSION=30000
         KSU_VERSION=$(expr $COMMITS_COUNT "+" $BASE_VERSION)
-
-        # Extract git tag at the sync point
         KSU_GIT_TAG=$(git describe --tags --abbrev=0 "$STOCK_COMMIT" 2>/dev/null || echo "no-tag")
-
         MANAGER_RUN_ID=$(gh api "repos/KernelSU-Next/KernelSU-Next/actions/workflows/build-manager-ci.yml/runs?head_sha=${STOCK_COMMIT}" --jq '.workflow_runs[0].id // empty')
         if [[ -n "${MANAGER_RUN_ID:-}" ]]; then
           KSU_MANAGER="https://github.com/KernelSU-Next/KernelSU-Next/actions/runs/${MANAGER_RUN_ID}"
           KSU_MANAGER_NOTE="built from stock dev commit ${STOCK_COMMIT:0:12} (exact match)"
         else
-          # Validated up-front in resolve-sources; a release cannot proceed without
-          # the exact manager run. Fail rather than link a mismatched manager.
           echo "ERROR: exact manager build no longer available for ${STOCK_COMMIT}" >&2
           exit 1
         fi
-
         echo "Commits count: $COMMITS_COUNT"
         echo "KSU Version: $KSU_VERSION"
         echo "KSU Git Tag: $KSU_GIT_TAG"
         echo "KSU Manager: $KSU_MANAGER"
-
-        # Exported for the release record; the notes themselves now come
-        # from the single release-notes-preview artifact (built by the
-        # notes-preview job from resolve-sources outputs).
         echo "KSUN_BRANCH=$KSU_INPUT" >> $GITHUB_ENV
         echo "KSUN_COMMIT=$KSUN_COMMIT" >> $GITHUB_ENV
         echo "KSU_COMMITS_COUNT=$COMMITS_COUNT" >> $GITHUB_ENV
@@ -1344,9 +1245,6 @@ jobs:
     - name: Verify release body is populated
       run: |
         set -euo pipefail
-        # resolve-sources outputs silently expand to empty when the job
-        # lacks it in `needs` (r20 shipped with _n/a_ everywhere). Fail
-        # fast instead of publishing thin notes.
         if grep -q '_n/a_' release_body.md; then
           echo "ERROR: release_body.md contains unresolved _n/a_ entries:" >&2
           grep '_n/a_' release_body.md >&2
@@ -1366,51 +1264,42 @@ jobs:
         merge-multiple: true
         if-no-files-found: ignore
 
-    # NOTE: one download-artifact step per kernel family. A single
-    # pattern ('*-AnyKernel3') silently truncates: run 34015449465
-    # downloaded only 495/591 artifacts, so r20 shipped 500/596 assets.
     - name: Download AnyKernel3 (5.10 android12)
       uses: actions/download-artifact@v7
       with:
         path: release-assets
         pattern: '5.10.*-android12-*-AnyKernel3'
         merge-multiple: false
-
     - name: Download AnyKernel3 (5.10 android13)
       uses: actions/download-artifact@v7
       with:
         path: release-assets
         pattern: '5.10.*-android13-*-AnyKernel3'
         merge-multiple: false
-
     - name: Download AnyKernel3 (5.15 android13)
       uses: actions/download-artifact@v7
       with:
         path: release-assets
         pattern: '5.15.*-android13-*-AnyKernel3'
         merge-multiple: false
-
     - name: Download AnyKernel3 (5.15 android14)
       uses: actions/download-artifact@v7
       with:
         path: release-assets
         pattern: '5.15.*-android14-*-AnyKernel3'
         merge-multiple: false
-
     - name: Download AnyKernel3 (6.1 android14)
       uses: actions/download-artifact@v7
       with:
         path: release-assets
         pattern: '6.1.*-android14-*-AnyKernel3'
         merge-multiple: false
-
     - name: Download AnyKernel3 (6.6 android15)
       uses: actions/download-artifact@v7
       with:
         path: release-assets
         pattern: '6.6.*-android15-*-AnyKernel3'
         merge-multiple: false
-
     - name: Download AnyKernel3 (6.12 android16)
       uses: actions/download-artifact@v7
       with:
@@ -1423,10 +1312,6 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: |
         set -euo pipefail
-
-        # Page the artifact list explicitly rather than with --paginate. On a
-        # run this large --paginate has been observed to stop early (1129 of
-        # 1229 artifacts), which silently undercounts the target.
         names=$(mktemp)
         for page in $(seq 1 50); do
           batch=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100&page=${page}" \
@@ -1436,14 +1321,7 @@ jobs:
           count=$(printf '%s\n' "$batch" | grep -c . || true)
           [ "$count" -lt 100 ] && break
         done
-
         expected=$(grep -c '\-AnyKernel3$' "$names" || true)
-
-        # download-artifact matches patterns server-side and, on a run with
-        # ~1200 artifacts, silently skipped some while still reporting success
-        # (run 36828639322: 496 of 609). Re-fetch anything it missed straight
-        # from the API so a pattern-matching miss cannot produce a short
-        # release.
         missing=0
         while IFS= read -r name; do
           [ -z "$name" ] && continue
@@ -1460,7 +1338,6 @@ jobs:
           fi
         done < <(grep '\-AnyKernel3$' "$names" || true)
         rm -f "$names"
-
         got=$(ls -d release-assets/*-AnyKernel3 2>/dev/null | wc -l)
         echo "AnyKernel3 artifacts in run: $expected, downloaded: $got, unrecoverable: $missing"
         if [ "$missing" -ne 0 ]; then
@@ -1484,7 +1361,6 @@ jobs:
       run: |
         set -e
         shopt -s nullglob
-
         for dir in release-assets/*-AnyKernel3; do
           zip_name="${dir}.zip"
           rm -f "$zip_name"
@@ -1497,7 +1373,6 @@ jobs:
       run: |
         set -e
         shopt -s nullglob
-
         for dir in release-assets/*NoMount-Metamodule; do
           zip_name="${dir}.zip"
           rm -f "$zip_name"
@@ -1510,8 +1385,6 @@ jobs:
       if: inputs.use_nomount
       run: |
         set -euo pipefail
-        # The metamodule silently missed r20 (artifact built fine, no zip
-        # on the release). Fail loud instead of shipping without it.
         if ! ls release-assets/NoMount-Metamodule.zip >/dev/null 2>&1; then
           echo "ERROR: use_nomount is true but release-assets/NoMount-Metamodule.zip is missing" >&2
           ls release-assets/ >&2
@@ -1528,18 +1401,12 @@ jobs:
       run: |
         set -euo pipefail
         shopt -s nullglob globstar
-
-        # Collect assets first so a glob miss fails fast instead of mid-release.
         files=(release-assets/**/*.zip release-assets/**/*.apk release-assets/**/*-boot*.img)
         if [ "${#files[@]}" -eq 0 ]; then
           echo "No release assets found" >&2
           exit 1
         fi
         echo "Uploading ${#files[@]} assets one at a time..."
-
-        # The release may already exist (partial upload from a retried run,
-        # or a concurrent run that computed the same tag). Refresh its notes
-        # so a re-run heals stale bodies instead of leaving them behind.
         if gh release view "$TAG_NAME" >/dev/null 2>&1; then
           echo "Release $TAG_NAME already exists — refreshing notes and uploading into it."
           gh release edit "$TAG_NAME" --notes-file release_body.md
@@ -1550,10 +1417,6 @@ jobs:
           fi
           gh release create "$TAG_NAME" "${create_args[@]}"
         fi
-
-        # Sequential uploads: one asset at a time with per-file retries.
-        # (The previous single-step bulk upload fired ~500 concurrent
-        # uploads and got the runner killed twice at the same point.)
         failed=0
         for f in "${files[@]}"; do
           ok=false
@@ -1629,7 +1492,6 @@ jobs:
           SUSFS_ANDROID14_6_1_SUKISU_ULTRA: ${{ needs.resolve-sources.outputs.susfs_commit_android14_6_1_sukisu_ultra }}
           SUSFS_ANDROID15_6_6_SUKISU_ULTRA: ${{ needs.resolve-sources.outputs.susfs_commit_android15_6_6_sukisu_ultra }}
           SUSFS_ANDROID16_6_12_SUKISU_ULTRA: ${{ needs.resolve-sources.outputs.susfs_commit_android16_6_12_sukisu_ultra }}
-          # KSU version not computed here; render will show placeholder if release job skipped
         run: |
           set -e
             python3 - <<'PYEOF' > release_body.md
@@ -1727,7 +1589,6 @@ jobs:
           for v in variants:
               _row=f"| gki-{v} |"
               for _fl in _flavors:
-                  # KowSU never ships SUSFS: render n/a rather than shared pins.
                   _sm={} if _fl=="kowsu" else (sus_map_sukisu_ultra if _fl=="sukisu-ultra" else (sus_map_resukisu if _fl=="resukisu" else sus_map))
                   sha=_sm.get(v,"")
                   sha_s=f"[`{sha[:7]}`]({_susfs_url}/-/commit/{sha})" if sha else "_n/a_"
@@ -1749,11 +1610,6 @@ jobs:
           if-no-files-found: warn
 
   nightly-release:
-    # Do not recreate `nightly` from a failed run. `notes-preview` is
-    # if: always() so a build failure still renders notes; without the
-    # result check below that meant a failed resolve-sources would
-    # delete the existing nightly tag and republish it from a body
-    # rendered off empty/absent inputs.
     if: >-
       always() &&
       needs.resolve-sources.result == 'success' &&
@@ -1794,4 +1650,3 @@ jobs:
             --prerelease \
             --title "Nightly (${{ github.ref_name }} $(date -u +%Y-%m-%d))" \
             --notes-file nightly/release_body.md
-
