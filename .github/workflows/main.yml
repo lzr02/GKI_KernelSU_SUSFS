@@ -232,7 +232,7 @@ jobs:
 
           PIN_NOMOUNT="5a610db7649a59eb3e3d710653618d594941f8da"
           PIN_KERNELSU="08a3b087e49227c8a6731c5f1114998b5e25255b"
-          PIN_RESUKISU="239e1e8871b8fcd51a6e5b3002e0ba522fdd99fb"
+          PIN_RESUKISU="8770c7e324a22895703c4916b8a16520e0b81c79"
           PIN_SUKISU_ULTRA="b20dee702035af09cb2ecb5f35443bbc1747f3e6"
           declare -A PIN_SUSFS=(
             [susfs_commit_android12_5_10]="9892175b4acec7ee844e113b8d02c0f4d12cdfac"
