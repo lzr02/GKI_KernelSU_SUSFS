@@ -86,6 +86,13 @@ on:
         required: false
         type: string
         default: "4k"
+      # ===== 新增：内核名称伪装 =====
+      spoof_uname:
+        description: "伪装内核名称（粘贴原厂 uname -r，留空=不伪装）"
+        required: false
+        type: string
+        default: ""
+      # ===== 新增结束 =====
 
 jobs:
   generate-matrix:
@@ -109,8 +116,6 @@ jobs:
 
           CONFIG_JSON=$(cat "${{ inputs.config_file }}" | jq -c .)
 
-          # Build { "include": [ {android_version:..., kernel_version:..., sublevel:..., os_patch_level:..., variant: ...}, ... ] }.
-          # An explicit patch-level filter keeps manual validation dispatches bounded.
           FINAL=$(jq -cn \
             --argjson cfg "$CONFIG_JSON" \
             --arg requested_variant "${{ inputs.variant }}" '
@@ -154,7 +159,6 @@ jobs:
             FINAL=$(jq -c --arg patch_level "$SELECTED_PATCH_LEVEL" '
               {include: [.include[] | select(.os_patch_level == $patch_level)]}
             ' <<< "$FINAL")
-            # No date matched -- try interpreting the value as a kernel sublevel
             if [ "$(jq '.include | length' <<< "$FINAL")" -eq 0 ]; then
               FINAL=$(jq -c --arg sublevel "$SELECTED_PATCH_LEVEL" '
                 {include: [.include[] | select(.sublevel == $sublevel)]}
@@ -171,10 +175,6 @@ jobs:
   build:
     needs: generate-matrix
     concurrency:
-      # Must include every matrix field that varies. The old key was only
-      # root_flavor + version, so every patch level of a family shared one
-      # group: with cancel-in-progress: false they queued instead of running
-      # in parallel, and an "All" dispatch compiled one kernel at a time.
       group: prepare-${{ inputs.root_flavor }}-${{ matrix.version }}-${{ matrix.sublevel }}-${{ matrix.os_patch_level }}-${{ matrix.variant }}
       cancel-in-progress: false
     strategy:
@@ -199,6 +199,9 @@ jobs:
       droidspaces_commit: ${{ inputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
       keep_kmi: ${{ inputs.keep_kmi }}
+      # ===== 新增：透传 spoof_uname =====
+      spoof_uname: ${{ inputs.spoof_uname }}
+      # ===== 新增结束 =====
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
       page_size: ${{ inputs.page_size }}
