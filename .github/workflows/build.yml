@@ -59,10 +59,16 @@ on:
         required: false
         type: string
         default: ""
-      brand_name:
+      spoof_uname:
+        description: "伪装内核名称：可直接粘贴原厂 uname -r，例如 5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284。留空=不伪装"
         required: false
         type: string
-        default: Wild
+        default: ""
+      brand_name:
+        description: "内核名称后缀。留空=保持 AOSP 原生名称（伪装模式下会被 spoof_uname 覆盖）"
+        required: false
+        type: string
+        default: ""
       keep_kmi:
         required: false
         type: boolean
@@ -440,8 +446,71 @@ jobs:
         android_version: ${{ inputs.android_version }}
         version: ${{ inputs.version }}
         sublevel: ${{ steps.extract.outputs.sublevel }}
-        brand_name: ${{ inputs.brand_name }}
+        # 指定了 spoof_uname 时禁用品牌后缀，避免两者互相覆盖
+        # 注意 GH 表达式里 '' 是假值，必须写成 == '' && X || '' 的形式
+        brand_name: ${{ inputs.spoof_uname == '' && inputs.brand_name || '' }}
         keep_kmi: ${{ inputs.keep_kmi }}
+
+    # =========================================================================
+    # 内核名称伪装（Uname Spoof）
+    #
+    # 在 common/scripts/setlocalversion 的 shebang 之后注入一段 early-return，
+    # 无论外部怎么调用它，都固定返回 spoof_uname 指定的后缀：
+    #   * build.sh / make 的普通调用        → 直接打印后缀
+    #   * Kleaf 的 --save-scmversion 调用    → 写入 .scmversion 后退出
+    # 由于该段早于原脚本的 scm_version / localversion 计算逻辑，因此
+    # -dirty / -maybe-dirty / git describe / CONFIG_LOCALVERSION 全部失效。
+    #
+    # 效果：uname -r == "<VERSION>.<SUBLEVEL><spoof_uname 去掉开头 x.y.z 的部分>"
+    # 例：5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284
+    # 留空则完全跳过，保持 AOSP 原生输出。
+    # =========================================================================
+    - name: Spoof Kernel Uname to Stock String
+      shell: bash
+      run: |
+        set -euo pipefail
+        V="${{ inputs.spoof_uname }}"
+        SETLOCAL="${{ github.workspace }}/kernel/common/scripts/setlocalversion"
+
+        if [ -z "$V" ]; then
+          echo "spoof_uname 为空，保持原生内核名称。"
+          exit 0
+        fi
+        if [ ! -f "$SETLOCAL" ]; then
+          echo "::error::未找到 $SETLOCAL"
+          exit 1
+        fi
+
+        # 允许直接粘贴完整 uname -r，自动去掉开头的版本号部分
+        SUFFIX="$(printf '%s' "$V" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//')"
+        echo "伪装后缀: ${SUFFIX}"
+
+        cp "$SETLOCAL" "$SETLOCAL.bak"
+        {
+          head -n 1 "$SETLOCAL"
+          cat <<INJECT
+
+        # ---- injected: stock uname spoof ----
+        if [ "\$1" = "--save-scmversion" ]; then
+          if [ ! -e .scmversion ]; then
+            printf '%s\n' "${SUFFIX}" > .scmversion
+          fi
+          exit 0
+        fi
+        printf '%s\n' "${SUFFIX}"
+        exit 0
+        # ---- end injected ----
+        INJECT
+          tail -n +2 "$SETLOCAL"
+        } > "$SETLOCAL.new"
+        mv "$SETLOCAL.new" "$SETLOCAL"
+        chmod +x "$SETLOCAL"
+
+        echo "=== 注入后的 setlocalversion 前 14 行 ==="
+        head -n 14 "$SETLOCAL"
+        echo "=== 自检输出 ==="
+        echo "普通调用     : $(sh "$SETLOCAL" 2>/dev/null || true)"
+        echo "make 参数调用: $(sh "$SETLOCAL" . android12-5.10 9 2>/dev/null || true)"
 
     - name: Remove Protected Exports
       uses: ./.github/actions/remove-protected-exports
