@@ -62,6 +62,11 @@ on:
         description: "Kernel Branding (empty = stock version string)"
         type: string
         default: Wild
+      spoof_uname:
+        description: "伪装内核名称。留空=不伪装"
+        required: false
+        type: string
+        default: ""
       keep_kmi:
         description: "Keep stock KMI generation suffix in kernel version (fix #265)"
         type: boolean
@@ -826,6 +831,7 @@ jobs:
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name || 'Wild' }}
+      spoof_uname: ${{ inputs.spoof_uname }}
       keep_kmi: ${{ inputs.keep_kmi || false }}
       use_bore: ${{ inputs.use_bore || true }}
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
@@ -858,6 +864,7 @@ jobs:
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name || 'Wild' }}
+      spoof_uname: ${{ inputs.spoof_uname }}
       keep_kmi: ${{ inputs.keep_kmi || false }}
       use_bore: ${{ inputs.use_bore || true }}
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
@@ -890,6 +897,7 @@ jobs:
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name || 'Wild' }}
+      spoof_uname: ${{ inputs.spoof_uname }}
       keep_kmi: ${{ inputs.keep_kmi || false }}
       use_bore: ${{ inputs.use_bore || true }}
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
@@ -922,6 +930,7 @@ jobs:
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name || 'Wild' }}
+      spoof_uname: ${{ inputs.spoof_uname }}
       keep_kmi: ${{ inputs.keep_kmi || false }}
       use_bore: ${{ inputs.use_bore || true }}
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
@@ -954,6 +963,7 @@ jobs:
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name || 'Wild' }}
+      spoof_uname: ${{ inputs.spoof_uname }}
       keep_kmi: ${{ inputs.keep_kmi || false }}
       use_bore: ${{ inputs.use_bore || true }}
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
@@ -986,6 +996,7 @@ jobs:
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name || 'Wild' }}
+      spoof_uname: ${{ inputs.spoof_uname }}
       keep_kmi: ${{ inputs.keep_kmi || false }}
       use_bore: ${{ inputs.use_bore || true }}
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
@@ -1018,6 +1029,7 @@ jobs:
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name || 'Wild' }}
+      spoof_uname: ${{ inputs.spoof_uname }}
       keep_kmi: ${{ inputs.keep_kmi || false }}
       use_bore: ${{ inputs.use_bore || true }}
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
