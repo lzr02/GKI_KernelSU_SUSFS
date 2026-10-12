@@ -63,10 +63,20 @@ on:
         required: false
         type: string
         default: Wild
+      spoof_uname:
+        description: "伪装内核名称。留空=不伪装"
+        required: false
+        type: string
+        default: ""
       keep_kmi:
         required: false
         type: boolean
         default: false
+      use_bore:
+        description: "Apply the BORE scheduler (false = stock scheduler, A/B boot tests)"
+        required: false
+        type: boolean
+        default: true
       allow_version_mismatch:
         required: false
         type: boolean
@@ -452,6 +462,47 @@ jobs:
           perl -i -pe 's/^(\s*)return 1$/$1print("Who Cares? Bypassing Now!")\n$1return 0/g if /if missing_symbols:/../return 1/' build/kernel/abi/check_buildtime_symbol_protection.py
         fi
 
+    - name: Spoof Kernel Uname to Stock String
+      shell: bash
+      run: |
+        set -euo pipefail
+        V="${{ inputs.spoof_uname }}"
+        SETLOCAL="${{ github.workspace }}/kernel/common/scripts/setlocalversion"
+        if [ -z "$V" ]; then
+          echo "spoof_uname 为空，保持原生内核名称。"
+          exit 0
+        fi
+        if [ ! -f "$SETLOCAL" ]; then
+          echo "::error::未找到 $SETLOCAL"
+          exit 1
+        fi
+        SUFFIX="$(printf '%s' "$V" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//')"
+        echo "伪装后缀: ${SUFFIX}"
+        cp "$SETLOCAL" "$SETLOCAL.bak"
+        {
+          head -n 1 "$SETLOCAL"
+          cat <<INJECT
+        # ---- injected: stock uname spoof ----
+        if [ "\$1" = "--save-scmversion" ]; then
+          if [ ! -e .scmversion ]; then
+            printf '%s\n' "${SUFFIX}" > .scmversion
+          fi
+          exit 0
+        fi
+        printf '%s\n' "${SUFFIX}"
+        exit 0
+        # ---- end injected ----
+        INJECT
+          tail -n +2 "$SETLOCAL"
+        } > "$SETLOCAL.new"
+        mv "$SETLOCAL.new" "$SETLOCAL"
+        chmod +x "$SETLOCAL"
+        echo "=== 注入后的 setlocalversion 前 14 行 ==="
+        head -n 14 "$SETLOCAL"
+        echo "=== 自检输出 ==="
+        echo "普通调用     : $(sh "$SETLOCAL" 2>/dev/null || true)"
+        echo "make 参数调用: $(sh "$SETLOCAL" . android12-5.10 9 2>/dev/null || true)"
+
     - name: Apply Kernel Branding
       uses: ./.github/actions/apply-kernel-branding
       with:
@@ -460,7 +511,7 @@ jobs:
         android_version: ${{ inputs.android_version }}
         version: ${{ inputs.version }}
         sublevel: ${{ steps.extract.outputs.sublevel }}
-        brand_name: ${{ inputs.brand_name }}
+        brand_name: ${{ inputs.spoof_uname == '' && inputs.brand_name || '' }}
         keep_kmi: ${{ inputs.keep_kmi }}
 
     - name: Remove Protected Exports
