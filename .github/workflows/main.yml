@@ -144,7 +144,12 @@ on:
     - cron: '0 5 * * 1'  # Monday 12am EST (5am UTC)
 
 jobs:
+  # Fork gate (#328): scheduled (cron) runs only proceed when the repo sets
+  # the Actions variable ENABLE_SCHEDULED_BUILDS=true. Forks don't copy
+  # variables, so their inherited nightly+sync crons skip (no minutes burned);
+  # workflow_dispatch is unaffected. Upstream sets the variable to 'true'.
   resolve-sources:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && vars.ENABLE_SCHEDULED_BUILDS == 'true')
     runs-on: ubuntu-latest
     outputs:
       nomount_commit: ${{ steps.resolve.outputs.nomount_commit }}
@@ -246,15 +251,30 @@ jobs:
           }
 
           # Audited pins (from root-variants.yml). Used only when commit_mode=verified.
-          PIN_NOMOUNT="5a610db7649a59eb3e3d710653618d594941f8da"
+          # NoMount: dev tip (2026-10-13, webui fix; module-side only, no kernel contract).
+          PIN_NOMOUNT="682f7b20bc3c177871c80bbd02c600e472f0df46"
           # KernelSU: synced with official main (0c0fdb96, 2026-10-12).
           # simonpunk's susfs sync commits (2026-10-12, all branches) rebased
           # 10_enable_susfs_for_ksu.patch onto this layout - it fails with 17
           # rejected hunks at the old 08a3b087 pin (run 38337419484) and
           # applies clean at 0c0fdb96. BBG is kernel-side and unaffected.
           PIN_KERNELSU="0c0fdb960178fa12d80d6cbcfdcb6ad8be6a865d"
-          PIN_BAKASU="f4435f007b16f61705089ff982e3f981a6017979"
-          PIN_SUKISU_ULTRA="b20dee702035af09cb2ecb5f35443bbc1747f3e6"
+          # BakaSU: fa12ffd (2026-10-11, tiann #3877 selinux_hide refactor)
+          # REMOVED `struct selinux_state fake_state` from their tree, but the
+          # fs patches (50_add_susfs) on 12-5.10/13-5.10/13-5.15/14-5.15/14-6.1
+          # still reference it under CONFIG_KSU_SUSFS, and BakaSU does not get
+          # the 10_enable glue that carries it for the kernelsu flavor -> every
+          # susfs >= 2026-05 (no susfs_def.h no_su API before that) links
+          # `fake_state` undefined with latest BakaSU on those 5 branches
+          # (run 38376968944, 183 BakaSU legs). 9097b1a = fa12ffd^ = the
+          # newest BakaSU that still defines+populates fake_state. 6.6/6.12 fs
+          # patches have no fake_state hunks, but a per-family root split isn't
+          # worth the root_matrix plumbing for 3 selinux_hide commits. Flip to
+          # latest when BakaSU upstream restores the contract.
+          PIN_BAKASU="9097b1a1c6c889756201bbc5713a84a9b23f7908"
+          # SukiSU-Ultra: builtin tip (2026-10-09, adds missing arch.h);
+          # defines fake_state itself, calls the susfs_def.h no_su API -> OK on tips.
+          PIN_SUKISU_ULTRA="6c284e957feaa9a388a9f1c37dc4ec80d95e434b"
           declare -A PIN_SUSFS=(
             [susfs_commit_android12_5_10]="82f08351fadb8b19dd6591bd14634d02ad832145"
             [susfs_commit_android13_5_10]="14c45388ec8cb3ca72f2ac8bf83097b9285a8418"
@@ -264,23 +284,25 @@ jobs:
             [susfs_commit_android15_6_6]="bd7d199ac87808001127e8a6d076832e2938cf0d"
             [susfs_commit_android16_6_12]="5e0b2b925865000ca7dce993ecf1d281ee312887"
           )
-          # BakaSU keeps its own SUSFS pin set: their selinux_hide implements
-          # the PRE-May-2026 contract - their tree has fake_status but does
-          # NOT define `fake_state`, which the synced fs patches (50_add_,
-          # since 5900f1a3 et al., 2026-05-12) reference and only the
-          # 10_enable patch (kernelsu flavor) defines. Run 38347077072: the
-          # BakaSU 6.1 leg died with ld.lld "undefined symbol: fake_state".
-          # Each pin = the last susfs commit on that branch BEFORE fake_state
-          # entered the fs patch (6.6's fs patch never gained it - tip is
-          # fine). SukiSU-Ultra defines fake_state itself -> stays on tips.
+          # BakaSU keeps its own SUSFS pin set (kept separate so it can diverge
+          # again). Values = the same verified branch tips as PIN_SUSFS:
+          # 9097b1a (see PIN_BAKASU) defines+populates fake_state, exactly like
+          # the 10_enable patch does for the kernelsu flavor, so tips link fine.
+          # History: the 2026-10-11 first attempt pinned "pre-fake_state"
+          # April-era commits - wrong on BOTH ends: those predate
+          # include/linux/susfs_def.h (the susfs_*_no_su API every modern root
+          # calls) -> run 38376968944 died with `undefined symbol:
+          # susfs_set_current_proc_no_su` on 183 BakaSU legs. There is NO susfs
+          # commit that satisfies post-fa12ffd BakaSU on the 5 older branches
+          # (fake_state hunks arrived 2026-05 together with susfs_def.h).
           declare -A PIN_SUSFS_BAKASU=(
-            [susfs_commit_android12_5_10]="e1681bc4d6fa90203a1fd86f26a8583baa4433dc"
-            [susfs_commit_android13_5_10]="6a47d9a4717a4d72244f4ec7197a69596f029730"
-            [susfs_commit_android13_5_15]="349ed52eea1be5c9590289a76a90d78710d4bba0"
-            [susfs_commit_android14_5_15]="16a22b6a608b3f124c64f70829657871eee3af37"
-            [susfs_commit_android14_6_1]="ef16cbce5c5195988b9b630de85466148cbbcdef"
+            [susfs_commit_android12_5_10]="82f08351fadb8b19dd6591bd14634d02ad832145"
+            [susfs_commit_android13_5_10]="14c45388ec8cb3ca72f2ac8bf83097b9285a8418"
+            [susfs_commit_android13_5_15]="bd27d727b27fc90bfbb6eaccd28060a53c473266"
+            [susfs_commit_android14_5_15]="5ef83a32d707c3f750a4c154b7f3b04464f7a031"
+            [susfs_commit_android14_6_1]="5192aa2d33b381b58c1051532f9e1dfa5de6e8d3"
             [susfs_commit_android15_6_6]="bd7d199ac87808001127e8a6d076832e2938cf0d"
-            [susfs_commit_android16_6_12]="fd03bb9c3cb4ee07b16806e0528e06486ab1be2b"
+            [susfs_commit_android16_6_12]="5e0b2b925865000ca7dce993ecf1d281ee312887"
           )
           # SukiSU-Ultra keeps its own SUSFS pin set too (same starting values).
           declare -A PIN_SUSFS_SUKISU_ULTRA=(
@@ -1057,7 +1079,7 @@ jobs:
     # when some jobs failed - the counts carry the bad news. Non-fatal by
     # design: a Telegram outage must never fail a build.
     name: Telegram Announce
-    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') }}
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && vars.ENABLE_SCHEDULED_BUILDS == 'true')) }}
     needs:
     - resolve-sources
     - build-android12-5-10
@@ -1119,6 +1141,66 @@ jobs:
             sleep 3
           done
           echo "WARN: local Bot API server did not come up; falling back to the cloud API (plain HTML cards)."
+
+      # --- BuildInfo-first digest input --------------------------------------
+      # The BuildInfo artifacts every successful leg ALREADY uploads carry
+      # everything the digest needs (kmi, root id/commit, kernel artifact
+      # id inside artifact_url). The announce downloads them with
+      # actions/download-artifact (runtime artifact service - not the REST
+      # jobs listing, which 502/504s on 600+ job runs) and assembles the
+      # digest input from them. Zero new artifacts. If a family failed /
+      # was cancelled (or no BuildInfo exists), the assembler exits 3 and
+      # the Post step falls back to the old REST fetch for the full
+      # picture with per-leg failure marks.
+      - name: Download BuildInfo artifacts
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          pattern: '*-BuildInfo'
+          path: /tmp/buildinfo
+
+      - name: Assemble digest input from BuildInfo
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FR_1: ${{ needs.build-android12-5-10.result }}
+          FR_2: ${{ needs.build-android13-5-10.result }}
+          FR_3: ${{ needs.build-android13-5-15.result }}
+          FR_4: ${{ needs.build-android14-5-15.result }}
+          FR_5: ${{ needs.build-android14-6-1.result }}
+          FR_6: ${{ needs.build-android15-6-6.result }}
+          FR_7: ${{ needs.build-android16-6-12.result }}
+        run: |
+          set -uo pipefail
+          results="build-android12-5-10=$FR_1,build-android13-5-10=$FR_2,build-android13-5-15=$FR_3,build-android14-5-15=$FR_4,build-android14-6-1=$FR_5,build-android15-6-6=$FR_6,build-android16-6-12=$FR_7"
+          if python3 .github/scripts/assemble_digest_input.py \
+              --buildinfo-dir /tmp/buildinfo \
+              --family-results "$results" \
+              --jobs-out /tmp/jobs.json \
+              --artifacts-out /tmp/artifacts.json; then
+            echo "DIGEST_SOURCE=buildinfo" >> "$GITHUB_ENV"
+            echo "Digest input assembled from BuildInfo artifacts (no jobs API calls)."
+            # Manager deep-links: manager APK artifacts are parent-run
+            # artifacts uploaded last, so one LIGHT listing page holds
+            # them. Failure here only drops manager buttons, not the post.
+            if gh api \
+              "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100&page=1" \
+              > /tmp/artifacts_p1.json 2>/dev/null; then
+              jq -s '[.[0].artifacts[]? | {name, id}]' /tmp/artifacts_p1.json > /tmp/mgr.json
+              if [ -s /tmp/mgr.json ] && [ "$(jq length /tmp/mgr.json)" -gt 0 ]; then
+                jq -s '.[0] + .[1] | unique_by(.name)' \
+                  /tmp/artifacts.json /tmp/mgr.json > /tmp/artifacts.merged.json \
+                  && mv /tmp/artifacts.merged.json /tmp/artifacts.json \
+                  && echo "merged $(jq length /tmp/mgr.json) listing-page artifacts (manager links)."
+              fi
+            else
+              echo "WARN: manager artifacts page fetch failed; posting without manager deep-links."
+            fi
+          else
+            echo "DIGEST_SOURCE=api" >> "$GITHUB_ENV"
+            echo "BuildInfo input unusable; will fall back to the jobs API fetch."
+          fi
+
       - name: Post per-family digests to Telegram topics
         shell: bash
         env:
@@ -1132,20 +1214,48 @@ jobs:
           RUN_ID="${{ github.run_id }}"
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${RUN_ID}"
           NIGHTLY_URL="https://nightly.link/${{ github.repository }}/actions/runs/${RUN_ID}"
+          if [ "${DIGEST_SOURCE:-api}" != "buildinfo" ]; then
           # Collect every page of the run's jobs (large runs exceed one page).
-          gh api --paginate \
-            "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100" \
-            > /tmp/jobs.json || { echo "jobs fetch failed; skipping announce"; exit 0; }
+          # Page-by-page with per-page retries: a monolithic `gh api
+          # --paginate` 504s on 600+ job runs and used to exit 0 silently -
+          # run 38376968944 posted NOTHING despite green families. Keep the
+          # concatenated-pages format the digest parser already tolerates.
+          : > /tmp/jobs.json
+          for page in $(seq 1 12); do
+            got=""
+            for try in 1 2 3 4 5 6 7 8; do
+              if gh api \
+                "repos/${{ github.repository }}/actions/runs/${RUN_ID}/jobs?per_page=100&page=${page}" \
+                > /tmp/jobs_page.json; then got=1; break; fi
+              echo "WARN: jobs page ${page} fetch attempt ${try} failed; retrying in $((try*30))s"
+              sleep $((try*30))
+            done
+            if [ -z "$got" ]; then
+              if [ "$page" -gt 1 ]; then
+                echo "jobs fetch still failing at page ${page}; posting with partial job data (pages 1-$((page-1)))"
+                break
+              fi
+              echo "jobs fetch failed; no job data at all; skipping announce"
+              exit 0
+            fi
+            cat /tmp/jobs_page.json >> /tmp/jobs.json
+            n=$(jq '.jobs | length' /tmp/jobs_page.json)
+            [ "$n" -lt 100 ] && break
+          done
           gh api --paginate \
             "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts?per_page=100" \
             > /tmp/artifacts.json || true
+          fi
           # No kernels built -> nothing to announce. The gate is the
           # artifact list: zero AnyKernel3 zips means every build failed
           # (or nothing ran), and a card that only says "it all failed"
           # is noise. A missing/unparseable artifact list still announces
           # (old behavior) rather than silently dropping good builds.
+          # Accepts both shapes: gh api --paginate page objects
+          # ([{artifacts: [...]}, ...]) and the records-assembled flat
+          # array of artifact dicts ([{name, id}, ...]).
           if [ -s /tmp/artifacts.json ] \
-             && AK3_COUNT=$(jq -s '[.[] | .artifacts[]? | select((.name // "") | contains("AnyKernel3"))] | length' /tmp/artifacts.json 2>/dev/null) \
+             && AK3_COUNT=$(jq -s '[.[] | if type == "object" and has("artifacts") then .artifacts[]? elif type == "array" then .[] else . end | select(((.name // "") | contains("AnyKernel3")))] | length' /tmp/artifacts.json 2>/dev/null) \
              && [ "${AK3_COUNT:-0}" -eq 0 ]; then
             echo "No AnyKernel3 artifacts in this run - no kernels built; skipping Telegram announce."
             exit 0
@@ -1889,7 +1999,7 @@ jobs:
         exit "$failed"
 
   notes-preview:
-    if: always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
+    if: always() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && vars.ENABLE_SCHEDULED_BUILDS == 'true'))
     needs: [resolve-sources, build-android12-5-10, build-android13-5-10, build-android13-5-15, build-android14-5-15, build-android14-6-1, build-android15-6-6, build-android16-6-12]
     runs-on: ubuntu-latest
     steps:
