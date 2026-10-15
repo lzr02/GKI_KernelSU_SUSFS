@@ -710,13 +710,13 @@ jobs:
                   -H "Authorization: Bearer ${GH_TOKEN}" \
                   "https://api.github.com/repos/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts")
                 if [ -z "$WANT" ]; then
-                  ART_IDS=$(echo "$AJSON" | jq -r '.artifacts[].id')
+                  ART_IDS=$(echo "$AJSON" | jq -r '.artifacts[] | "\(.id) \(.name)"')
                 else
                   ART_IDS=$(echo "$AJSON" | jq -r --arg want "$WANT" '
                     ($want | split(",")) as $wl |
-                    .artifacts[] | select(.name as $n | any($wl[]; $n == .)) | .id')
+                    .artifacts[] | select(.name as $n | any($wl[]; $n == .)) | "\(.id) \(.name)"')
                 fi
-                echo "$ART_IDS" | while read -r AID; do
+                echo "$ART_IDS" | while read -r AID ART_NAME; do
                   [ -n "$AID" ] || continue
                   curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
                     -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -728,6 +728,23 @@ jobs:
                   for apk in _${AID}/*.apk; do
                     [ -f "$apk" ] || continue
                     NAME="$(basename "$apk")"
+                    # Spoofed-manager artifacts (BakaSU/SukiSU upstream CI)
+                    # package APKs under the SAME filename as the stock
+                    # build. A flat cp -f then silently overwrites stock
+                    # with spoofed (or vice versa) - run 38659164844 lost
+                    # the BakaSU spoofed manager this way and the digest
+                    # had no spoofed download. Disambiguate: when the
+                    # upstream artifact is a spoofed one but the APK name
+                    # does not say so, suffix the filename. The digest's
+                    # FLAVOR_MANAGERS already expects *-spoofed.apk.
+                    case "$ART_NAME" in
+                      *poofed*)
+                        case "$NAME" in
+                          *poofed*) ;;
+                          *) NAME="${NAME%.apk}-spoofed.apk" ;;
+                        esac
+                        ;;
+                    esac
                     cp -f "$apk" "$OUT_APKS/$NAME"
                     echo "$OWNER|$REPO|$NAME" >> "$MANIFEST"
                   done
@@ -736,7 +753,11 @@ jobs:
               fi
             )
           done
-          # Filter BakaSU to only release universal and universal spoofed (drop debug/non-universal)
+          # Filter BakaSU to release arm64/universal APKs only (drop debug,
+          # 32-bit, riscv64). Upstream re-packaged 2026-10-14: artifacts now
+          # carry per-ABI APKs (arm64-v8a/armeabi-v7a/riscv64) instead of a
+          # single universal APK - keep arm64-v8a (all our devices) plus the
+          # legacy universal name.
           if grep -q "Baka-SU|BakaSU|" "$MANIFEST" 2>/dev/null; then
             tmp_manifest="${MANIFEST}.filtered"
             : > "$tmp_manifest"
@@ -744,10 +765,10 @@ jobs:
               [ -n "$n" ] || continue
               if [ "$o" = "Baka-SU" ] && [ "$r" = "BakaSU" ]; then
                 ln=$(echo "$n" | tr '[:upper:]' '[:lower:]')
-                # keep only universal apks, drop debug
-                if [[ "$ln" != *universal* ]]; then echo "Dropping BakaSU non-universal $n" >&2; rm -f "$OUT_APKS/$n"; continue; fi
+                # keep universal (old packaging) or arm64-v8a (new), drop debug
+                if [[ "$ln" != *universal* && "$ln" != *arm64-v8a* ]]; then echo "Dropping BakaSU non-arm64 $n" >&2; rm -f "$OUT_APKS/$n"; continue; fi
                 if [[ "$ln" == *debug* ]]; then echo "Dropping BakaSU debug $n" >&2; rm -f "$OUT_APKS/$n"; continue; fi
-                # now only universal release and universal spoofed remain
+                # now only arm64/universal release + spoofed remain
               fi
               echo "$o|$r|$n" >> "$tmp_manifest"
             done < "$MANIFEST"
@@ -1093,8 +1114,10 @@ jobs:
     env:
       TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-      # Testing-release group: gets one combined "new testing release"
-      # card per run (chat id + forum topic id - edit here to re-route).
+      # Release-only group: gets one combined "new release" card, ONLY on
+      # real Release dispatches (user request 2026-10-15) - testing/CI/
+      # nightly builds no longer post here. Chat id + forum topic id -
+      # edit here to re-route.
       TG_TEST_CHAT: "-1002358137390"
       TG_TEST_TOPIC: "245705"
       # Component pins for the card's Root/Features block (release-notes
@@ -1346,18 +1369,15 @@ jobs:
             fi
           done < /tmp/digest.out
 
-          # Combined testing-release card: one message in the testing group
+          # Combined release card: one message in the release group
           # linking each family's digest post in the announcement group,
           # with a t.me button row per family + the all-artifacts button.
-          if [ -n "$TG_TEST_CHAT" ] && [ -n "$TG_TEST_TOPIC" ] && [ -n "$FAMILY_LINKS" ]; then
-            # Same testing warning as the family cards (gated identically).
-            TEST_WARN=""
-            if [ "${RELEASE_TYPE}" != "Release" ]; then
-              TEST_WARN="⚠️ <b>Testing release</b> — please back up your data before flashing.<br>"
-              TEST_WARN_MD="⚠️ **Testing release** — please back up your data before flashing."$'\n\n'
-            else
-              TEST_WARN_MD=""
-            fi
+          # RELEASE-ONLY (user request 2026-10-15): this group hears about
+          # a build only when release_type == "Release" - testing, CI,
+          # pre-release and nightly builds post nothing here (the per-family
+          # topic cards in the announcement group still post every run).
+          if [ "${RELEASE_TYPE}" = "Release" ] && [ -n "$TG_TEST_CHAT" ] && [ -n "$TG_TEST_TOPIC" ] && [ -n "$FAMILY_LINKS" ]; then
+            # Release-only card: no testing warning is ever shown here.
             ALL_ROW=$(jq -nc --arg u "${NIGHTLY_URL}" \
               '[{text:"📦 All artifacts",url:$u}]' 2>/dev/null || true)
             TEST_BTN_ROWS="${FAMILY_BTN_ROWS}${ALL_ROW}"
@@ -1365,9 +1385,9 @@ jobs:
             if [ -n "${TG_API:-}" ]; then
               # Rich combined card (same dialect as the family cards).
               RICH_ALL="<tg-button-row><tg-button type=\"url\" style=\"success\" url=\"${NIGHTLY_URL}\">📦 All artifacts</tg-button></tg-button-row>"
-              RICH_MSG=$(printf '# 👋 New Testing Release\n\n**Wild Kernels** — %s\n\nRun: [#%s](%s)\n\n%s%s\n\n%s' \
+              RICH_MSG=$(printf '# 👋 New Release\n\n**Wild Kernels** — %s\n\nRun: [#%s](%s)\n\n%s\n\n%s' \
                 "${{ github.ref_name }}" "${RUN_ID}" "${RUN_URL}" \
-                "${TEST_WARN_MD}" "${RICH_BTN_ROWS}" "${RICH_ALL}")
+                "${RICH_BTN_ROWS}" "${RICH_ALL}")
               TBODY=$(jq -nc --arg chat "$TG_TEST_CHAT" --arg topic "$TG_TEST_TOPIC" --arg md "$RICH_MSG" \
                 '{chat_id: ($chat|tonumber? // $chat),
                   message_thread_id: ($topic|tonumber? // $topic),
@@ -1382,7 +1402,7 @@ jobs:
             fi
             if [ -z "$TRESP" ]; then
               COMBINED=$(printf '%s' \
-                "👋 <b>Hello, new testing release here:</b><br>🔨 <b>Wild Kernels</b> — <code>${{ github.ref_name }}</code><br><b>Run</b>: <a href=\"${RUN_URL}\">#${RUN_ID}</a><br>${TEST_WARN}<ul>${FAMILY_LINKS}</ul>")
+                "👋 <b>Hello, new release here:</b><br>🔨 <b>Wild Kernels</b> — <code>${{ github.ref_name }}</code><br><b>Run</b>: <a href=\"${RUN_URL}\">#${RUN_ID}</a><br><ul>${FAMILY_LINKS}</ul>")
               MK=( )
               if [ -n "$TEST_BTN_ROWS" ]; then
                 TEST_BUTTONS=$(jq -nc --argjson rows "[${TEST_BTN_ROWS%,}]" \
@@ -1405,9 +1425,11 @@ jobs:
                 "${TG_API:-https://api.telegram.org}/bot${TG_TOKEN}/pinChatMessage" \
                 -d "chat_id=${TG_TEST_CHAT}" -d "message_id=${TMID}" \
                 -d "disable_notification=true" > /dev/null \
-                || echo "WARN: could not pin in the testing group (needs pin permission)"
+                || echo "WARN: could not pin in the release group (needs pin permission)"
             fi
             sent=$((sent + 1))
+          else
+            echo "combined release card skipped (RELEASE_TYPE='${RELEASE_TYPE:-}' - release-only group)"
           fi
           echo "announced ${sent} message(s)"
 
