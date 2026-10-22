@@ -4,6 +4,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: build-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,6 +16,7 @@ on:
         type: choice
         options:
           - CI
+          - Nightly
           - Pre-Release
           - Release
         default: CI
@@ -19,10 +24,6 @@ on:
         description: "Use ccache/bazel cache (restore/save)"
         type: boolean
         default: true
-      allow_version_mismatch:
-        description: "Force-load modules with mismatched symbol versions ( force check_version() to pass )"
-        type: boolean
-        default: false
       kernel_build_version:
         description: "Kernel Version"
         type: choice
@@ -48,14 +49,11 @@ on:
           - 4k
           - 16k
         default: 4k
-      brand_name:
-        description: "Kernel Branding (empty = stock version string)"
+      spoof_uname:
+        description: "伪装内核名称。留空=不伪装"
+        required: false
         type: string
-        default: Wild
-      keep_kmi:
-        description: "Keep stock KMI generation suffix in kernel version (fix #265)"
-        type: boolean
-        default: false
+        default: ""
       commit_mode:
         description: "latest = branch tips, verified = audited pins, update = build latest then promote verified pins on success"
         required: false
@@ -65,19 +63,34 @@ on:
           - verified
           - update
         default: verified
-      root_flavor:
-        description: "Root Flavor"
-        type: choice
-        options:
-          - KernelSU-Next
-          - KernelSU
-          - BakaSU
-          - SukiSU-Ultra
-          - KowSU
-          - FinaSU
-          - No Root
-          - All (KernelSU-Next + KernelSU + BakaSU)
-        default: All (KernelSU-Next + KernelSU + BakaSU)
+      build_kernelsu:
+        description: "构建 KernelSU (官方)"
+        type: boolean
+        default: true
+      build_kernelsu_next:
+        description: "构建 KernelSU-Next"
+        type: boolean
+        default: true
+      build_bakasu:
+        description: "构建 BakaSU"
+        type: boolean
+        default: true
+      build_sukisu_ultra:
+        description: "构建 SukiSU-Ultra (需要 SUSFS 开启)"
+        type: boolean
+        default: false
+      build_kowsu:
+        description: "构建 KowSU (需要 SUSFS 关闭)"
+        type: boolean
+        default: false
+      build_finasu:
+        description: "构建 FinaSU (需要 SUSFS 开启)"
+        type: boolean
+        default: false
+      build_none:
+        description: "构建 No Root (无 Root 方案, 不能与其他同时勾选)"
+        type: boolean
+        default: false
       use_susfs:
         description: "SUSFS"
         type: boolean
@@ -122,8 +135,8 @@ on:
         description: "Render release notes preview only (skip all builds + release)"
         type: boolean
         default: false
-  # schedule:  # nightly automatic builds disabled - user opt-in via workflow_dispatch only
-  #   - cron: "0 5 * * 1" # Monday 12am EST (5am UTC)
+  schedule:
+    - cron: "0 5 * * 1" # Monday 12am EST (5am UTC)
 
 jobs:
   # Fork gate (#328): scheduled (cron) runs only proceed when the repo sets
@@ -234,63 +247,71 @@ jobs:
           }
 
           # Audited pins (from root-variants.yml). Used only when commit_mode=verified.
-          # NoMount: dev tip (2026-10-20, "kernel: use store_release for
-          # d_flags in nm_hijack_dentry_ops"; module-side only, no kernel contract).
-          PIN_NOMOUNT="e240bb031820fd3f7de5dadb007281b33bb70634"
-          # KernelSU: official main tip (46636100, 2026-10-20,
-          # "manager: remove DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION (#3927)").
-          # The susfs patch (10_enable_susfs_for_ksu) was verified to apply at
-          # the old 0c0fdb96 pin; this tip is several manager commits ahead of
-          # that layout - re-confirm the patch applies before relying on this
-          # pin for susfs/root builds. BBG is kernel-side and unaffected.
-          PIN_KERNELSU="4663610011d03771a64e7c36a2aa65bd1794022d"
-          # BakaSU: official main tip (2026-10-20,
-          # "manager: support multiple module repositories, one-shot scripts and
-          # other minimal fixes (#600)"). Advanced per user request to track
-          # latest despite the fa12ffd fake_state removal - the 5 older branches
-          # (12-5.10/13-5.10/13-5.15/14-5.15/14-6.1) fs patches reference
-          # `fake_state` and will fail to link with latest BakaSU; 6.6/6.12 are
-          # unaffected. Watch those 5 families for build failures.
-          PIN_BAKASU="dac2d186406a0d2b0ce3c67cad5a1fa1adbf9f4d"
-          # SukiSU-Ultra: builtin tip (2026-10-21,
-          # "kernel: switch sig_fallback hook from weak symbol to static_call");
+          # NoMount: dev tip (2026-10-13, webui fix; module-side only, no kernel contract).
+          PIN_NOMOUNT="682f7b20bc3c177871c80bbd02c600e472f0df46"
+          # KernelSU: synced with official main (0c0fdb96, 2026-10-12).
+          # simonpunk's susfs sync commits (2026-10-12, all branches) rebased
+          # 10_enable_susfs_for_ksu.patch onto this layout - it fails with 17
+          # rejected hunks at the old 08a3b087 pin (run 38337419484) and
+          # applies clean at 0c0fdb96. BBG is kernel-side and unaffected.
+          PIN_KERNELSU="0c0fdb960178fa12d80d6cbcfdcb6ad8be6a865d"
+          # BakaSU: fa12ffd (2026-10-11, tiann #3877 selinux_hide refactor)
+          # REMOVED `struct selinux_state fake_state` from their tree, but the
+          # fs patches (50_add_susfs) on 12-5.10/13-5.10/13-5.15/14-5.15/14-6.1
+          # still reference it under CONFIG_KSU_SUSFS, and BakaSU does not get
+          # the 10_enable glue that carries it for the kernelsu flavor -> every
+          # susfs >= 2026-05 (no susfs_def.h no_su API before that) links
+          # `fake_state` undefined with latest BakaSU on those 5 branches
+          # (run 38376968944, 183 BakaSU legs). 9097b1a = fa12ffd^ = the
+          # newest BakaSU that still defines+populates fake_state. 6.6/6.12 fs
+          # patches have no fake_state hunks, but a per-family root split isn't
+          # worth the root_matrix plumbing for 3 selinux_hide commits. Flip to
+          # latest when BakaSU upstream restores the contract.
+          PIN_BAKASU="9097b1a1c6c889756201bbc5713a84a9b23f7908"
+          # SukiSU-Ultra: builtin tip (2026-10-09, adds missing arch.h);
           # defines fake_state itself, calls the susfs_def.h no_su API -> OK on tips.
-          PIN_SUKISU_ULTRA="05f5cdf082d32bbc651c205ba4bdd1dc66cca7f5"
+          PIN_SUKISU_ULTRA="6c284e957feaa9a388a9f1c37dc4ec80d95e434b"
           # FinaSU: susfs-integrated fork of the tiann restructure; pin tracks
           # the susfs4ksu v2.3 ABI era its supercall dispatch is written against.
-          # master tip 3f06a69d (2026-10-21, manager install-page animation;
-          # kernel ABI unchanged).
-          PIN_FINASU="3f06a69d40db4cbb5b86d239694c5adf911b2cce"
+          PIN_FINASU="40c97e24d155f23364d8ebfe4b247034dc6547ef"
           declare -A PIN_SUSFS=(
-            [susfs_commit_android12_5_10]="f43926dc94b8ffbf9b74321313536600f69367b1"
-            [susfs_commit_android13_5_10]="cbe3fe7b9fa599d316f68b08b06cde48218eaff5"
-            [susfs_commit_android13_5_15]="86b5b10068459dedb545dc5db46a0f0254428eda"
-            [susfs_commit_android14_5_15]="10b4f2156470338a5db2040f3d85992c285aa595"
-            [susfs_commit_android14_6_1]="b57ed1998b82c4e3a2a81cdbf11172a560979c40"
-            [susfs_commit_android15_6_6]="4a4cb1be85a4694372d3efb9420de69982eac29a"
-            [susfs_commit_android16_6_12]="9c9f19d8395693327c78df36569b44e94c187b8a"
+            [susfs_commit_android12_5_10]="82f08351fadb8b19dd6591bd14634d02ad832145"
+            [susfs_commit_android13_5_10]="14c45388ec8cb3ca72f2ac8bf83097b9285a8418"
+            [susfs_commit_android13_5_15]="bd27d727b27fc90bfbb6eaccd28060a53c473266"
+            [susfs_commit_android14_5_15]="5ef83a32d707c3f750a4c154b7f3b04464f7a031"
+            [susfs_commit_android14_6_1]="5192aa2d33b381b58c1051532f9e1dfa5de6e8d3"
+            [susfs_commit_android15_6_6]="bd7d199ac87808001127e8a6d076832e2938cf0d"
+            [susfs_commit_android16_6_12]="5e0b2b925865000ca7dce993ecf1d281ee312887"
           )
           # BakaSU keeps its own SUSFS pin set (kept separate so it can diverge
-          # again). Values = the same verified branch tips as PIN_SUSFS, now
-          # tracking latest alongside PIN_BAKASU.
+          # again). Values = the same verified branch tips as PIN_SUSFS:
+          # 9097b1a (see PIN_BAKASU) defines+populates fake_state, exactly like
+          # the 10_enable patch does for the kernelsu flavor, so tips link fine.
+          # History: the 2026-10-11 first attempt pinned "pre-fake_state"
+          # April-era commits - wrong on BOTH ends: those predate
+          # include/linux/susfs_def.h (the susfs_*_no_su API every modern root
+          # calls) -> run 38376968944 died with `undefined symbol:
+          # susfs_set_current_proc_no_su` on 183 BakaSU legs. There is NO susfs
+          # commit that satisfies post-fa12ffd BakaSU on the 5 older branches
+          # (fake_state hunks arrived 2026-05 together with susfs_def.h).
           declare -A PIN_SUSFS_BAKASU=(
-            [susfs_commit_android12_5_10]="f43926dc94b8ffbf9b74321313536600f69367b1"
-            [susfs_commit_android13_5_10]="cbe3fe7b9fa599d316f68b08b06cde48218eaff5"
-            [susfs_commit_android13_5_15]="86b5b10068459dedb545dc5db46a0f0254428eda"
-            [susfs_commit_android14_5_15]="10b4f2156470338a5db2040f3d85992c285aa595"
-            [susfs_commit_android14_6_1]="b57ed1998b82c4e3a2a81cdbf11172a560979c40"
-            [susfs_commit_android15_6_6]="4a4cb1be85a4694372d3efb9420de69982eac29a"
-            [susfs_commit_android16_6_12]="9c9f19d8395693327c78df36569b44e94c187b8a"
+            [susfs_commit_android12_5_10]="82f08351fadb8b19dd6591bd14634d02ad832145"
+            [susfs_commit_android13_5_10]="14c45388ec8cb3ca72f2ac8bf83097b9285a8418"
+            [susfs_commit_android13_5_15]="bd27d727b27fc90bfbb6eaccd28060a53c473266"
+            [susfs_commit_android14_5_15]="5ef83a32d707c3f750a4c154b7f3b04464f7a031"
+            [susfs_commit_android14_6_1]="5192aa2d33b381b58c1051532f9e1dfa5de6e8d3"
+            [susfs_commit_android15_6_6]="bd7d199ac87808001127e8a6d076832e2938cf0d"
+            [susfs_commit_android16_6_12]="5e0b2b925865000ca7dce993ecf1d281ee312887"
           )
           # SukiSU-Ultra keeps its own SUSFS pin set too (same starting values).
           declare -A PIN_SUSFS_SUKISU_ULTRA=(
-            [susfs_commit_android12_5_10]="f43926dc94b8ffbf9b74321313536600f69367b1"
-            [susfs_commit_android13_5_10]="cbe3fe7b9fa599d316f68b08b06cde48218eaff5"
-            [susfs_commit_android13_5_15]="86b5b10068459dedb545dc5db46a0f0254428eda"
-            [susfs_commit_android14_5_15]="10b4f2156470338a5db2040f3d85992c285aa595"
-            [susfs_commit_android14_6_1]="b57ed1998b82c4e3a2a81cdbf11172a560979c40"
-            [susfs_commit_android15_6_6]="4a4cb1be85a4694372d3efb9420de69982eac29a"
-            [susfs_commit_android16_6_12]="9c9f19d8395693327c78df36569b44e94c187b8a"
+            [susfs_commit_android12_5_10]="82f08351fadb8b19dd6591bd14634d02ad832145"
+            [susfs_commit_android13_5_10]="14c45388ec8cb3ca72f2ac8bf83097b9285a8418"
+            [susfs_commit_android13_5_15]="bd27d727b27fc90bfbb6eaccd28060a53c473266"
+            [susfs_commit_android14_5_15]="5ef83a32d707c3f750a4c154b7f3b04464f7a031"
+            [susfs_commit_android14_6_1]="5192aa2d33b381b58c1051532f9e1dfa5de6e8d3"
+            [susfs_commit_android15_6_6]="bd7d199ac87808001127e8a6d076832e2938cf0d"
+            [susfs_commit_android16_6_12]="5e0b2b925865000ca7dce993ecf1d281ee312887"
           )
 
           pick() { # pinned repo ref  -> pinned when verified, else latest
@@ -311,12 +332,10 @@ jobs:
           emit kernelsu_commit "$(resolve_sha https://github.com/KernelSU-Next/KernelSU-Next.git refs/heads/dev)"
           echo "kernelsu_branch=dev" >> "$GITHUB_OUTPUT"
 
-          # Selected root implementation(s). Maps the human-facing choice
-          # (KernelSU-Next / KernelSU / BakaSU / SukiSU-Ultra / KowSU /
-          # No Root / All) to internal root-setup flavors (next / kernelsu /
-          # bakasu / sukisu-ultra / kowsu / none). 'All' emits a matrix of
-          # the three core root flavors plus each pinned commit; SukiSU-Ultra,
-          # KowSU, and No Root are opt-in only and never part of 'All'.
+          # Selected root implementation(s). Seven boolean checkboxes replace
+          # the old single-choice dropdown; the matrix below fans out every
+          # checked flavor in any combination. "No Root" is exclusive (it
+          # ships no root implementation, so it cannot be combined).
           #
           # kernelsu, bakasu, and sukisu-ultra pin in verified mode;
           # KernelSU-Next (next) always builds at latest.
@@ -361,66 +380,131 @@ jobs:
             printf '{"root_flavor":"%s","variant":"%s","root_commit":"%s","produce":%s}' "$1" "$2" "$3" "$4"
           }
 
-          # On 'schedule' there are no inputs, so the default must be the exact
-          # label the "All" arm matches below — a bare 'All' fell through to *)
-          # and failed the whole job, yet the manager step's All* glob still
-          # matched, so the two steps disagreed. Keep these in sync.
-          case "${{ inputs.root_flavor || 'All (KernelSU-Next + KernelSU + BakaSU)' }}" in
-            KernelSU)
-              echo "root_flavor=kernelsu" >> "$GITHUB_OUTPUT"
-              emit root_commit "$KERNELSU_COMMIT"
-              ROOT_MATRIX="[$(mk_entry kernelsu KernelSU "$KERNELSU_COMMIT" true)]"
-              ;;
-            KernelSU-Next)
-              echo "root_flavor=next" >> "$GITHUB_OUTPUT"
-              emit root_commit "$NEXT_COMMIT"
-              ROOT_MATRIX="[$(mk_entry next KernelSU-Next "$NEXT_COMMIT" true)]"
-              ;;
-            BakaSU)
-              echo "root_flavor=bakasu" >> "$GITHUB_OUTPUT"
-              emit root_commit "$BAKASU_COMMIT"
-              ROOT_MATRIX="[$(mk_entry bakasu BakaSU "$BAKASU_COMMIT" true)]"
-              ;;
-            SukiSU-Ultra)
-              echo "root_flavor=sukisu-ultra" >> "$GITHUB_OUTPUT"
-              emit root_commit "$SUKISU_ULTRA_COMMIT"
-              ROOT_MATRIX="[$(mk_entry sukisu-ultra SukiSU-Ultra "$SUKISU_ULTRA_COMMIT" true)]"
-              ;;
-            FinaSU)
-              if [ "${{ inputs.use_susfs }}" = "false" ]; then
-                echo "ERROR: FinaSU requires SUSFS — re-run with SUSFS on." >&2
-                exit 1
-              fi
-              echo "root_flavor=finasu" >> "$GITHUB_OUTPUT"
-              emit root_commit "$FINASU_COMMIT"
-              ROOT_MATRIX="[$(mk_entry finasu FinaSU "$FINASU_COMMIT" true)]"
-              ;;
-            KowSU)
-              if [ "${{ inputs.use_susfs }}" = "true" ]; then
-                echo "ERROR: KowSU does not work together with SUSFS — re-run with SUSFS off." >&2
-                exit 1
-              fi
-              echo "root_flavor=kowsu" >> "$GITHUB_OUTPUT"
-              emit root_commit "$KOWSU_COMMIT"
-              ROOT_MATRIX="[$(mk_entry kowsu KowSU "$KOWSU_COMMIT" true)]"
-              ;;
-            "No Root")
-              echo "root_flavor=none" >> "$GITHUB_OUTPUT"
-              echo "root_commit=" >> "$GITHUB_OUTPUT"
-              ROOT_MATRIX='[{"root_flavor":"none","variant":"NoRoot","root_commit":""}]'
-              ROOT_MATRIX="[$(mk_entry none NoRoot "" true)]"
-              ;;
-            "All (KernelSU-Next + KernelSU + BakaSU)")
-              # Fan out to all three root variants, each with its pinned commit.
-              ROOT_MATRIX="[$(mk_entry next KernelSU-Next "$NEXT_COMMIT" true),$(mk_entry kernelsu KernelSU "$KERNELSU_COMMIT" false),$(mk_entry bakasu BakaSU "$BAKASU_COMMIT" false)]"
-              echo "root_flavor=" >> "$GITHUB_OUTPUT"
-              echo "root_commit=" >> "$GITHUB_OUTPUT"
-              ;;
-            *)
-              echo "ERROR: unknown root_flavor '${{ inputs.root_flavor }}'" >&2
+          # Root selection: seven boolean checkboxes, any combination.
+          # Scheduled runs carry no inputs - the booleans are empty strings,
+          # not false - so nightlies build the three core flavors (old "All"
+          # behaviour; SukiSU-Ultra/KowSU/FinaSU/No Root were never in it).
+          # The first selected flavor carries produce=true so exactly one
+          # leg per family uploads the stock-configs artifact.
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            B_NEXT=true; B_KSU=true; B_BAKASU=true
+            B_SUKISU=false; B_KOWSU=false; B_FINASU=false; B_NONE=false
+          else
+            B_NEXT="${{ inputs.build_kernelsu_next }}"
+            B_KSU="${{ inputs.build_kernelsu }}"
+            B_BAKASU="${{ inputs.build_bakasu }}"
+            B_SUKISU="${{ inputs.build_sukisu_ultra }}"
+            B_KOWSU="${{ inputs.build_kowsu }}"
+            B_FINASU="${{ inputs.build_finasu }}"
+            B_NONE="${{ inputs.build_none }}"
+          fi
+
+          # Flavor constraints carried over from the old single-choice input
+          # (SCHED_SUSFS is resolved above: true on schedule, else the input).
+          if [ "$B_FINASU" = "true" ] && [ "$SCHED_SUSFS" != "true" ]; then
+            echo "ERROR: FinaSU requires SUSFS - re-run with SUSFS on." >&2
+            exit 1
+          fi
+          if [ "$B_KOWSU" = "true" ] && [ "$SCHED_SUSFS" = "true" ]; then
+            echo "ERROR: KowSU does not work together with SUSFS - re-run with SUSFS off." >&2
+            exit 1
+          fi
+          # "No Root" ships no root implementation, so it cannot be combined.
+          if [ "$B_NONE" = "true" ]; then
+            if [ "$B_NEXT" = "true" ] || [ "$B_KSU" = "true" ] || [ "$B_BAKASU" = "true" ] || \
+               [ "$B_SUKISU" = "true" ] || [ "$B_KOWSU" = "true" ] || [ "$B_FINASU" = "true" ]; then
+              echo "ERROR: No Root cannot be combined with other root flavors." >&2
               exit 1
-              ;;
-          esac
+            fi
+          fi
+
+          ROOT_ITEMS=()
+          ROOT_SELECTED=""
+          FIRST=true
+          add_entry() { # flavor variant commit
+            local produce entry
+            if [ "$FIRST" = "true" ]; then
+              produce=true
+              FIRST=false
+            else
+              produce=false
+            fi
+            entry="$(mk_entry "$1" "$2" "$3" "$produce")"
+            ROOT_ITEMS+=("$entry")
+            if [ -z "$ROOT_SELECTED" ]; then
+              ROOT_SELECTED="$1"
+            else
+              ROOT_SELECTED="${ROOT_SELECTED}+$1"
+            fi
+          }
+
+          if [ "$B_NEXT" = "true" ]; then
+            add_entry next KernelSU-Next "$NEXT_COMMIT"
+          fi
+          if [ "$B_KSU" = "true" ]; then
+            add_entry kernelsu KernelSU "$KERNELSU_COMMIT"
+          fi
+          if [ "$B_BAKASU" = "true" ]; then
+            add_entry bakasu BakaSU "$BAKASU_COMMIT"
+          fi
+          if [ "$B_SUKISU" = "true" ]; then
+            add_entry sukisu-ultra SukiSU-Ultra "$SUKISU_ULTRA_COMMIT"
+          fi
+          if [ "$B_KOWSU" = "true" ]; then
+            add_entry kowsu KowSU "$KOWSU_COMMIT"
+          fi
+          if [ "$B_FINASU" = "true" ]; then
+            add_entry finasu FinaSU "$FINASU_COMMIT"
+          fi
+          if [ "$B_NONE" = "true" ]; then
+            add_entry none NoRoot ""
+          fi
+
+          if [ ${#ROOT_ITEMS[@]} -eq 0 ]; then
+            echo "ERROR: at least one root flavor must be selected." >&2
+            exit 1
+          fi
+          echo "Selected root flavors: ${ROOT_SELECTED}"
+
+          # Single selection keeps the legacy root_flavor/root_commit outputs
+          # populated; multi-select leaves them empty (old "All" behaviour).
+          if [ ${#ROOT_ITEMS[@]} -eq 1 ]; then
+            case "$ROOT_SELECTED" in
+              next)
+                echo "root_flavor=next" >> "$GITHUB_OUTPUT"
+                emit root_commit "$NEXT_COMMIT"
+                ;;
+              kernelsu)
+                echo "root_flavor=kernelsu" >> "$GITHUB_OUTPUT"
+                emit root_commit "$KERNELSU_COMMIT"
+                ;;
+              bakasu)
+                echo "root_flavor=bakasu" >> "$GITHUB_OUTPUT"
+                emit root_commit "$BAKASU_COMMIT"
+                ;;
+              sukisu-ultra)
+                echo "root_flavor=sukisu-ultra" >> "$GITHUB_OUTPUT"
+                emit root_commit "$SUKISU_ULTRA_COMMIT"
+                ;;
+              finasu)
+                echo "root_flavor=finasu" >> "$GITHUB_OUTPUT"
+                emit root_commit "$FINASU_COMMIT"
+                ;;
+              kowsu)
+                echo "root_flavor=kowsu" >> "$GITHUB_OUTPUT"
+                emit root_commit "$KOWSU_COMMIT"
+                ;;
+              none)
+                echo "root_flavor=none" >> "$GITHUB_OUTPUT"
+                echo "root_commit=" >> "$GITHUB_OUTPUT"
+                ;;
+            esac
+          else
+            echo "root_flavor=" >> "$GITHUB_OUTPUT"
+            echo "root_commit=" >> "$GITHUB_OUTPUT"
+          fi
+
+          ROOT_MATRIX="[$(IFS=,; echo "${ROOT_ITEMS[*]}")]"
           echo "root_matrix=$ROOT_MATRIX" >> "$GITHUB_OUTPUT"
 
           # SUSFS per supported Android/kernel branch (gitlab simonpunk/susfs4ksu).
@@ -594,24 +678,39 @@ jobs:
             esac
           }
 
-          FLAVORS="${{ inputs.root_flavor || 'All' }}"
-          echo "Root flavor: ${FLAVORS}"
+          # Manager APKs follow the same root checkboxes as the build matrix.
+          # Scheduled runs never reach this step (the job is
+          # workflow_dispatch-only), so inputs are always defined here.
+          # No Root ships no manager APK.
+          MG_NEXT="${{ inputs.build_kernelsu_next }}"
+          MG_KSU="${{ inputs.build_kernelsu }}"
+          MG_BAKASU="${{ inputs.build_bakasu }}"
+          MG_SUKISU="${{ inputs.build_sukisu_ultra }}"
+          MG_KOWSU="${{ inputs.build_kowsu }}"
+          MG_FINASU="${{ inputs.build_finasu }}"
+
+          MG_FLAVORS=""
+          if [ "$MG_NEXT" = "true" ]; then MG_FLAVORS="$MG_FLAVORS next"; fi
+          if [ "$MG_KSU" = "true" ]; then MG_FLAVORS="$MG_FLAVORS kernelsu"; fi
+          if [ "$MG_BAKASU" = "true" ]; then MG_FLAVORS="$MG_FLAVORS bakasu"; fi
+          if [ "$MG_SUKISU" = "true" ]; then MG_FLAVORS="$MG_FLAVORS sukisu-ultra"; fi
+          if [ "$MG_KOWSU" = "true" ]; then MG_FLAVORS="$MG_FLAVORS kowsu"; fi
+          if [ "$MG_FINASU" = "true" ]; then MG_FLAVORS="$MG_FLAVORS finasu"; fi
+
           LIST=""
-          case "${FLAVORS}" in
-            All*) LIST=$(jq -c -n '[inputs]' <<< "$(resolve_one next)"$'\n'"$(resolve_one kernelsu)"$'\n'"$(resolve_one bakasu)") ;;
-            KernelSU-Next) LIST=$(jq -c -n '[inputs]' <<< "$(resolve_one next)") ;;
-            KernelSU) LIST=$(jq -c -n '[inputs]' <<< "$(resolve_one kernelsu)") ;;
-            BakaSU) LIST=$(jq -c -n '[inputs]' <<< "$(resolve_one bakasu)") ;;
-            SukiSU-Ultra) LIST=$(jq -c -n '[inputs]' <<< "$(resolve_one sukisu-ultra)") ;;
-            KowSU) LIST=$(jq -c -n '[inputs]' <<< "$(resolve_one kowsu)") ;;
-            FinaSU) LIST=$(jq -c -n '[inputs]' <<< "$(resolve_one finasu)") ;;
-            *) echo "Skipping manager resolution (no root flavor / none)." ;;
-          esac
+          for mg_flavor in $MG_FLAVORS; do
+            ENTRY="$(resolve_one "$mg_flavor")"
+            if [ -n "$ENTRY" ]; then
+              if [ -z "$LIST" ]; then LIST="$ENTRY"; else LIST="$LIST"$'\n'"$ENTRY"; fi
+            fi
+          done
+
           if [ -n "$LIST" ]; then
-            echo "manager_list=$LIST" >> "$GITHUB_OUTPUT"
-            echo "Manager sources resolved."
+            echo "manager_list=$(jq -c -n '[inputs]' <<< "$LIST")" >> "$GITHUB_OUTPUT"
+            echo "Manager sources resolved for:${MG_FLAVORS}"
           else
             echo "manager_list=[]" >> "$GITHUB_OUTPUT"
+            echo "No root flavor selected - no manager APKs."
           fi
 
       - name: Compose requested feature set
@@ -900,10 +999,11 @@ jobs:
       ksu_branch: ${{ needs.resolve-sources.outputs.kernelsu_commit }}
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
-      brand_name: ${{ inputs.brand_name || 'Wild' }}
-      keep_kmi: ${{ inputs.keep_kmi || false }}
+      brand_name: 'Wild'
+      spoof_uname: ${{ inputs.spoof_uname }}
+      keep_kmi: false
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
-      allow_version_mismatch: ${{ inputs.allow_version_mismatch || false }}
+      allow_version_mismatch: false
       use_cache: ${{ inputs.use_cache || (github.event_name == 'schedule' && true) || false }}
       page_size: ${{ inputs.page_size || '4k' }}
     secrets: inherit
@@ -931,10 +1031,11 @@ jobs:
       ksu_branch: ${{ needs.resolve-sources.outputs.kernelsu_commit }}
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
-      brand_name: ${{ inputs.brand_name || 'Wild' }}
-      keep_kmi: ${{ inputs.keep_kmi || false }}
+      brand_name: 'Wild'
+      spoof_uname: ${{ inputs.spoof_uname }}
+      keep_kmi: false
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
-      allow_version_mismatch: ${{ inputs.allow_version_mismatch || false }}
+      allow_version_mismatch: false
       use_cache: ${{ inputs.use_cache || (github.event_name == 'schedule' && true) || false }}
       page_size: ${{ inputs.page_size || '4k' }}
     secrets: inherit
@@ -962,10 +1063,11 @@ jobs:
       ksu_branch: ${{ needs.resolve-sources.outputs.kernelsu_commit }}
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
-      brand_name: ${{ inputs.brand_name || 'Wild' }}
-      keep_kmi: ${{ inputs.keep_kmi || false }}
+      brand_name: 'Wild'
+      spoof_uname: ${{ inputs.spoof_uname }}
+      keep_kmi: false
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
-      allow_version_mismatch: ${{ inputs.allow_version_mismatch || false }}
+      allow_version_mismatch: false
       use_cache: ${{ inputs.use_cache || (github.event_name == 'schedule' && true) || false }}
       page_size: ${{ inputs.page_size || '4k' }}
     secrets: inherit
@@ -993,10 +1095,11 @@ jobs:
       ksu_branch: ${{ needs.resolve-sources.outputs.kernelsu_commit }}
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
-      brand_name: ${{ inputs.brand_name || 'Wild' }}
-      keep_kmi: ${{ inputs.keep_kmi || false }}
+      brand_name: 'Wild'
+      spoof_uname: ${{ inputs.spoof_uname }}
+      keep_kmi: false
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
-      allow_version_mismatch: ${{ inputs.allow_version_mismatch || false }}
+      allow_version_mismatch: false
       use_cache: ${{ inputs.use_cache || (github.event_name == 'schedule' && true) || false }}
       page_size: ${{ inputs.page_size || '4k' }}
     secrets: inherit
@@ -1024,10 +1127,11 @@ jobs:
       ksu_branch: ${{ needs.resolve-sources.outputs.kernelsu_commit }}
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
-      brand_name: ${{ inputs.brand_name || 'Wild' }}
-      keep_kmi: ${{ inputs.keep_kmi || false }}
+      brand_name: 'Wild'
+      spoof_uname: ${{ inputs.spoof_uname }}
+      keep_kmi: false
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
-      allow_version_mismatch: ${{ inputs.allow_version_mismatch || false }}
+      allow_version_mismatch: false
       use_cache: ${{ inputs.use_cache || (github.event_name == 'schedule' && true) || false }}
       page_size: ${{ inputs.page_size || '4k' }}
     secrets: inherit
@@ -1055,10 +1159,11 @@ jobs:
       ksu_branch: ${{ needs.resolve-sources.outputs.kernelsu_commit }}
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
-      brand_name: ${{ inputs.brand_name || 'Wild' }}
-      keep_kmi: ${{ inputs.keep_kmi || false }}
+      brand_name: 'Wild'
+      spoof_uname: ${{ inputs.spoof_uname }}
+      keep_kmi: false
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
-      allow_version_mismatch: ${{ inputs.allow_version_mismatch || false }}
+      allow_version_mismatch: false
       use_cache: ${{ inputs.use_cache || (github.event_name == 'schedule' && true) || false }}
       page_size: ${{ inputs.page_size || '4k' }}
     secrets: inherit
@@ -1086,10 +1191,11 @@ jobs:
       ksu_branch: ${{ needs.resolve-sources.outputs.kernelsu_commit }}
       anykernel3_commit: ${{ needs.resolve-sources.outputs.anykernel3_commit }}
       droidspaces_commit: ${{ needs.resolve-sources.outputs.droidspaces_commit }}
-      brand_name: ${{ inputs.brand_name || 'Wild' }}
-      keep_kmi: ${{ inputs.keep_kmi || false }}
+      brand_name: 'Wild'
+      spoof_uname: ${{ inputs.spoof_uname }}
+      keep_kmi: false
       os_patch_level: ${{ inputs.os_patch_level || 'All' }}
-      allow_version_mismatch: ${{ inputs.allow_version_mismatch || false }}
+      allow_version_mismatch: false
       use_cache: ${{ inputs.use_cache || (github.event_name == 'schedule' && true) || false }}
       page_size: ${{ inputs.page_size || '4k' }}
     secrets: inherit
@@ -1435,6 +1541,9 @@ jobs:
           echo "announced ${sent} message(s)"
 
   update-verified-pins:
+    concurrency:
+      group: update-verified-pins-${{ github.repository }}
+      cancel-in-progress: false
     if: "github.event_name == 'workflow_dispatch' && !inputs.test_release_notes && inputs.commit_mode == 'update'"
     runs-on: ubuntu-latest
     permissions:
@@ -1469,10 +1578,10 @@ jobs:
           SUKISU_ULTRA_SHA: ${{ needs.resolve-sources.outputs.sukisu_ultra_commit }}
           FINASU_SHA: ${{ needs.resolve-sources.outputs.finasu_commit }}
           APPROVE_NOMOUNT: ${{ inputs.use_nomount }}
-          APPROVE_KERNELSU: ${{ (inputs.root_flavor == 'KernelSU' || startsWith(inputs.root_flavor, 'All')) }}
-          APPROVE_BAKASU: ${{ (inputs.root_flavor == 'BakaSU' || startsWith(inputs.root_flavor, 'All')) }}
-          APPROVE_SUKISU_ULTRA: ${{ inputs.root_flavor == 'SukiSU-Ultra' }}
-          APPROVE_FINASU: ${{ inputs.root_flavor == 'FinaSU' }}
+          APPROVE_KERNELSU: ${{ inputs.build_kernelsu }}
+          APPROVE_BAKASU: ${{ inputs.build_bakasu }}
+          APPROVE_SUKISU_ULTRA: ${{ inputs.build_sukisu_ultra }}
+          APPROVE_FINASU: ${{ inputs.build_finasu }}
 
       - name: Commit promoted pins
         if: always() && steps.promote.conclusion == 'success'
@@ -2036,7 +2145,10 @@ jobs:
       - uses: actions/checkout@v7
       - name: Render release notes preview (always)
         env:
-          ROOT_FLAVOR: ${{ inputs.root_flavor }}
+          # Composed from the root checkboxes; empty on schedule (the render
+          # script then falls back to its "All" default, matching the
+          # nightly three-core-flavor build).
+          ROOT_FLAVOR: ${{ (inputs.build_kernelsu && 'KernelSU ' || '') }}${{ (inputs.build_kernelsu_next && 'KernelSU-Next ' || '') }}${{ (inputs.build_bakasu && 'BakaSU ' || '') }}${{ (inputs.build_sukisu_ultra && 'SukiSU-Ultra ' || '') }}${{ (inputs.build_kowsu && 'KowSU ' || '') }}${{ (inputs.build_finasu && 'FinaSU ' || '') }}${{ (inputs.build_none && 'No Root ' || '') }}
           FEATURE_SET: ${{ needs.resolve-sources.outputs.feature_set }}
           MANAGER_LIST: ${{ needs.resolve-sources.outputs.manager_list }}
           ROOT_MATRIX: ${{ needs.resolve-sources.outputs.root_matrix }}

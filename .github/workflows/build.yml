@@ -63,6 +63,11 @@ on:
         required: false
         type: string
         default: Wild
+      spoof_uname:
+        description: "Spoof the stock kernel version string (uname). Empty = no spoof"
+        required: false
+        type: string
+        default: ""
       keep_kmi:
         required: false
         type: boolean
@@ -92,6 +97,13 @@ jobs:
     name: "${{ inputs.kernel_version }}.${{ inputs.sublevel }}-${{ inputs.android_version }}-${{ inputs.os_patch_level }} (${{ inputs.variant }})"
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    concurrency:
+      # Must include every input that varies across matrix legs. Without
+      # sublevel/variant/page_size, several distinct builds collide on one key
+      # and, with cancel-in-progress: false, queue behind each other instead of
+      # running in parallel — one kernel compiles at a time.
+      group: build-${{ inputs.root_flavor }}-${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sublevel }}-${{ inputs.os_patch_level }}-${{ inputs.variant }}${{ inputs.page_size }}
+      cancel-in-progress: false
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
@@ -444,6 +456,49 @@ jobs:
           commit: ${{ inputs.nomount_commit }}
           kernel_version: ${{ inputs.kernel_version }}
 
+      - name: Spoof Kernel Uname and Build Time
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ inputs.spoof_uname }}"
+          SETLOCAL="${{ github.workspace }}/kernel/common/scripts/setlocalversion"
+
+          # 1. 注入编译日期环境变量，骗过 uname -v
+          echo "KBUILD_BUILD_TIMESTAMP=Mon May 5 04:20:00 UTC 2025" >> $GITHUB_ENV
+
+          if [ -z "$V" ]; then
+            echo "spoof_uname 为空，保持原生内核名称。"
+            exit 0
+          fi
+
+          if [ ! -f "$SETLOCAL" ]; then
+            echo "::error::未找到 $SETLOCAL"
+            exit 1
+          fi
+
+          # 2. 提取伪装后缀
+          SUFFIX="$(printf '%s' "$V" | sed -E 's/^[0-9]+\.[0-9]+\.[0-9]+//')"
+          echo "伪装内核后缀: ${SUFFIX}"
+
+          cp "$SETLOCAL" "$SETLOCAL.bak"
+          # 3. 使用 printf 写入，绝对避免 YAML 缩进导致的 heredoc 闭合失败问题
+          {
+            head -n 1 "$SETLOCAL"
+            printf '%s\n' "# ---- injected: stock uname spoof ----"
+            printf '%s\n' 'if [ "$1" = "--save-scmversion" ]; then'
+            printf '%s\n' "  if [ ! -e .scmversion ]; then"
+            printf '%s\n' "    printf '%s\n' \"${SUFFIX}\" > .scmversion"
+            printf '%s\n' "  fi"
+            printf '%s\n' "  exit 0"
+            printf '%s\n' "fi"
+            printf '%s\n' "printf '%s\n' \"${SUFFIX}\""
+            printf '%s\n' "exit 0"
+            printf '%s\n' "# ---- end injected ----"
+            tail -n +2 "$SETLOCAL"
+          } > "$SETLOCAL.new"
+          mv "$SETLOCAL.new" "$SETLOCAL"
+          chmod +x "$SETLOCAL"
+
       - name: Apply Kernel Branding
         uses: ./.github/actions/apply-kernel-branding
         with:
@@ -452,7 +507,7 @@ jobs:
           android_version: ${{ inputs.android_version }}
           version: ${{ inputs.version }}
           sublevel: ${{ steps.extract.outputs.sublevel }}
-          brand_name: ${{ inputs.brand_name }}
+          brand_name: ${{ inputs.spoof_uname == '' && inputs.brand_name || '' }}
           keep_kmi: ${{ inputs.keep_kmi }}
 
       - name: Remove Protected Exports
