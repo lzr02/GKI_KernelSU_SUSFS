@@ -66,6 +66,11 @@ on:
         required: false
         type: string
         default: Wild
+      spoof_uname:
+        description: "Spoof the stock kernel version string (uname). Empty = no spoof"
+        required: false
+        type: string
+        default: ""
       keep_kmi:
         description: "Keep stock KMI generation suffix in kernel version (fix #265)"
         required: false
@@ -344,6 +349,7 @@ jobs:
       anykernel3_commit: ${{ inputs.anykernel3_commit }}
       droidspaces_commit: ${{ inputs.droidspaces_commit }}
       brand_name: ${{ inputs.brand_name }}
+      spoof_uname: ${{ inputs.spoof_uname }}
       keep_kmi: ${{ inputs.keep_kmi }}
       allow_version_mismatch: ${{ inputs.allow_version_mismatch }}
       use_cache: ${{ inputs.use_cache }}
